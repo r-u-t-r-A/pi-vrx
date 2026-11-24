@@ -25,7 +25,7 @@ void out_drm_stop(out_drm_t *o);
 /* Web viewer: MJPEG stream + status page. */
 typedef size_t (*status_json_fn)(void *ctx, char *buf, size_t n);
 typedef struct {
-    int port;
+    int port;           /* 0: 80 and 8080 */
     int fps;
     int quality;
     status_json_fn status;

@@ -39,6 +39,7 @@ typedef struct {
     div_mode_t mode;
     double t_last;
     uint64_t f_last;
+    uint64_t skip_last;
     float fps;
 } app_t;
 
@@ -171,6 +172,13 @@ static void print_status(app_t *a)
     }
     if (fused && atomic_load(&decoder_stats(fused)->locked))
         o += snprintf(line + o, sizeof(line) - (size_t)o, "fused %4.1fdB | ", atomic_load(&decoder_stats(fused)->snr_db));
+    uint64_t skip = fused ? atomic_load(&decoder_stats(fused)->fields_skipped) : 0;
+    for (int r = 0; !fused && r < a->nrx; r++)
+        skip += atomic_load(&decoder_stats(pipeline_rx(a->pl, r))->fields_skipped);
+    if (skip != a->skip_last)
+        o += snprintf(line + o, sizeof(line) - (size_t)o, "CPU overload, %llu fields skipped | ",
+                      (unsigned long long)(skip - a->skip_last));
+    a->skip_last = skip;
     snprintf(line + o, sizeof(line) - (size_t)o, "%.1f fps", a->fps);
     LOGI("%s", line);
 }
@@ -201,7 +209,7 @@ static void usage(void)
 "      --av-progressive    288p/240p instead of 576i/480i\n"
 "      --hdmi-mode M       auto | WxH@HZ                                     (default auto)\n"
 "      --stretch           fill the screen (default keeps 4:3)\n"
-"      --web-port N        (default 8080)   --web-fps N (25)   --jpeg-quality N (70)\n"
+"      --web-port N        (default 80 and 8080)   --web-fps N (30)   --jpeg-quality N (70)\n"
 "      --deint bob|weave   (default bob: 50/60 fps, lowest latency)\n"
 "      --no-osd            hide the receiver signal bars\n"
 "\n"
@@ -258,7 +266,7 @@ int main(int argc, char **argv)
 
     const char *src_spec = "smi", *outputs = "hdmi,web", *rec_path = NULL, *hdmi_mode = "auto";
     bool rx_b = true, fast = false, osd = true, stretch = false;
-    int web_port = 8080, web_fps = 25, jpeg_q = 70;
+    int web_port = 0, web_fps = 30, jpeg_q = 70;
     deint_t deint = DEINT_BOB;
     bool div_given = false;
     video_std_t av_std = STD_UNKNOWN;
@@ -521,6 +529,7 @@ int main(int argc, char **argv)
     if (pipeline_fusion(pl)) {
         fusion_stats_t *fs = fusion_stats(pipeline_fusion(pl));
         decoder_stats_t *st = decoder_stats(pipeline_fused(pl));
+        LOGD("fused: skipped fields %llu", (unsigned long long)atomic_load(&st->fields_skipped));
         LOGD("fused: fields %llu, vsyncs %llu (rejected %llu, flywheel %llu), lock losses %llu, snr %.1f dB, "
              "B delay %.3f us, outliers A %llu B %llu, realigns %llu",
              (unsigned long long)atomic_load(&st->fields), (unsigned long long)atomic_load(&st->vsyncs),
