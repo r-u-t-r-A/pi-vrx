@@ -32,6 +32,7 @@ add_library(c5core STATIC
   src/reclock.c
   src/pipeline.c
   src/frame.c
+  src/jumpers.c
   src/source.c
   src/source_synth.c
   src/source_file.c
