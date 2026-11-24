@@ -59,6 +59,40 @@ Notes:
   analog output, e.g. for goggles, at the same time.
 - **One receiver only:** wire receiver A and run with `--rx A` (8-bit SMI).
 
+## Output jumpers
+
+Two jumpers choose the output. They work while c5div runs with `-o jumpers`
+(the service default), with half a second of debounce.
+
+| Jumper | Pins | Open | Fitted |
+|---|---|---|---|
+| AV | GPIO4 (pin 7) to GND (pin 9) | HDMI | composite AV |
+| Wi-Fi | GPIO5 (pin 29) to GND (pin 30) | off | web viewer on |
+
+HDMI and AV share the Pi's pixel pipeline, so only one runs at a time; the
+web viewer runs next to either. The Wi-Fi jumper starts and stops the viewer,
+not the access point (`pi/setup-ap.sh`). If you use pin 9 or 30 as a ground for
+a receiver, move that ground to another pin.
+
+The AV jumper is also read at power-on (`[gpio4=0]` in `config.txt` sets
+`enable_tvout=1`, which the Raspberry Pi docs ask for on Zero boards). If
+switching while running gives no AV picture, reboot with the jumper fitted.
+
+## Composite AV connection
+
+- **Zero 2W:** test pads on the underside
+  ([drawing](https://files.waveshare.com/upload/1/11/Raspberry-pi-zero-2-w-test-pads.pdf)).
+  Underside facing you, 40-pin header at the top: both pads are along the
+  bottom edge, 3 mm up from it. **TV** is 45.6 mm from the left board edge and its
+  **GND** is 3.8 mm further right. Solder a short shielded wire (TV to the
+  core, GND to the shield) and fix it with glue: the pads tear off easily.
+- **Pi 3B:** 3.5 mm jack, 4-pole. Tip and first ring are audio, second ring is
+  **ground**, sleeve is **video**. Many camcorder cables have these two swapped.
+- The output is 1 Vpp into 75 Ω, no extra parts needed.
+
+The standard follows the camera (576i PAL / 480i NTSC). `--av-std pal|ntsc` forces
+one, `--av-progressive` outputs 288p/240p for displays that flicker on interlaced video.
+
 ## Antennas for diversity
 
 Diversity helps most when the two receivers fade at different times:
@@ -81,10 +115,15 @@ sudo c5div probe               # with both C5s running
 `install.sh` adds this to `/boot/firmware/config.txt` (and makes a backup):
 
 ```
+dtoverlay=vc4-kms-v3d,composite   # (changes the existing line) AV connector next to HDMI
 dtoverlay=c5div-smi    # SMI on GPIO 8-13 and 16-21 only
 dtoverlay=smi-dev      # /dev/smi character device
 dtparam=spi=off        # GPIO8-11 are SPI0 otherwise
 dtparam=i2s=off        # GPIO18-21 are I2S otherwise
+gpio=4,5=ip,pu         # output jumpers
+[gpio4=0]              # AV jumper fitted at power-on
+enable_tvout=1
+[all]
 ```
 
 If `/dev/smi` is missing after the reboot, check `dmesg | grep -i smi` and

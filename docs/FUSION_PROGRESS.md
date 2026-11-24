@@ -50,6 +50,9 @@ container, the host has no sanitizer runtime).
    `nohup /usr/local/bin/c5div run --rx A --workers 3 -o web,hdmi > /tmp/c5div.log &`
 2. **Pi, fuse CPU**: `c5div run -s synth:pal ...` is too slow there to be useful as a source; copy a two-lane recording over
    (`-s file:...`) and time it. If too slow: NEON for `reclock_feed` / `interp_b`, fewer BTAPS, SR_TAPS 8 -> 6.
+   Also deploy the AV output and jumpers (docs/WIRING.md): run `pi/config-txt.sh`, reboot, then check: AV picture with the jumper
+   fitted at boot; HDMI<->AV while running; `[gpio4=0]` / `enable_tvout` behaviour on the Zero 2W (docs and forums disagree).
+   The installed /etc/default/c5div is kept by install.sh: set `--output jumpers` there by hand.
 3. **Second XIAO**: header pins 36, 11, 12, 35, 38, 40 (GPIO16-21). Check 16-bit gapless capture (50 MB/s), then live: A-B delay,
    outlier rate, one C5 restarting, one antenna shadowed. Both C5s must be on the same channel.
 4. **Known gaps**: noise clipped at code 0 biases the sync depth (picture gain) at very low SNR, for every mode; both receivers in a
@@ -59,4 +62,3 @@ container, the host has no sanitizer runtime).
 
 - Do not touch the C5 serial port (`/dev/ttyACM0`) without asking: opening it can reset and hang the C5.
 - `c5div record` and `probe` on the Pi kill a running c5div's capture (shared DMA channel).
-- Pi: `ruter@ruzero.local`.
