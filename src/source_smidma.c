@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -111,6 +112,7 @@ struct smi_settings {
 #define CB_BYTES     (NCB * 32u)
 #define HANDLE_FILE  "/run/c5div-smidma"        /* buffers of a running capture */
 #define OWNER_FILE   "/run/c5div-smidma-chan"   /* channels used since boot (stays until reboot) */
+#define LOCK_FILE "/run/c5div-capture.lock"
 
 typedef struct {
     uint32_t ti, src, dst, len, stride, next, pad[2];
@@ -122,7 +124,7 @@ typedef struct {
 } vcmem_t;
 
 typedef struct {
-    int smi_fd, mem_fd, mbox_fd;
+    int smi_fd, mem_fd, mbox_fd, lock_fd;
     volatile uint32_t *smi, *dma;
     int chan;
     vcmem_t ring, cbs;
@@ -211,6 +213,29 @@ static void fatal_handler(int sig)
 }
 
 /* A previous run that was killed: stop its channel, release its buffers. */
+/* One capture at a time: a second one would take the channel and buffers away
+ * from the first. The lock goes away with its process, however it ends. */
+static int capture_lock(smidma_t *p)
+{
+    p->lock_fd = open(LOCK_FILE, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (p->lock_fd < 0) {
+        LOGE("smi: %s: %s (run as root)", LOCK_FILE, strerror(errno));
+        return -1;
+    }
+    if (flock(p->lock_fd, LOCK_EX | LOCK_NB)) {
+        char pid[16] = "";
+        if (read(p->lock_fd, pid, sizeof(pid) - 1) > 0)
+            pid[strcspn(pid, "\n")] = 0;
+        LOGE("smi: another c5div is already capturing (pid %s). If that is the service: sudo systemctl stop c5div", pid);
+        close(p->lock_fd);
+        p->lock_fd = -1;
+        return -1;
+    }
+    if (ftruncate(p->lock_fd, 0) == 0)
+        dprintf(p->lock_fd, "%d\n", (int)getpid());
+    return 0;
+}
+
 static void reclaim_previous(smidma_t *p)
 {
     FILE *f = fopen(HANDLE_FILE, "r");
@@ -368,6 +393,7 @@ static long dma_pos(smidma_t *p)
 static void *smidma_thread(void *arg)
 {
     source_t *s = arg;
+    thread_begin("capture");
     smidma_t *p = s->priv;
     const source_cfg_t *c = &s->cfg;
     const int bps = c->smi_width / 8;
@@ -390,6 +416,7 @@ static void *smidma_thread(void *arg)
     ring_block_t *b = NULL;
     size_t fill = 0;               /* bytes in the current block */
     unsigned no_progress = 0;
+    double t_warn = -1e9;
 
     while (s->running && atomic_load(&g_running)) {
         if (total && captured >= total)
@@ -403,10 +430,9 @@ static void *smidma_thread(void *arg)
         }
         long w = dma_pos(p);
         double t = now_s();
-        if (w < 0) {
-            usleep(500);
-            continue;
-        }
+        const bool lost = w < 0;        /* channel reset or pointing elsewhere */
+        if (lost)
+            w = rpos;
         long avail = w - rpos;
         if (avail < 0)
             avail += RING_BYTES;
@@ -423,10 +449,20 @@ static void *smidma_thread(void *arg)
                 no_progress = 0;
                 uint32_t cs = rd(p->smi, SMI_CS);
                 uint32_t dcs = p->dma[(DMA_CH(p->chan) + DMA_CS) / 4];
-                LOGW("smi: no data for 200 ms (smi cs=0x%08x dma cs=0x%08x debug=0x%08x conblk=0x%08x dest=0x%08x)",
-                     cs, dcs, p->dma[(DMA_CH(p->chan) + DMA_DEBUG) / 4],
+                if (t - t_warn > 10.0) {
+                    t_warn = t;
+                    LOGW("smi: no data for 200 ms (smi cs=0x%08x dma cs=0x%08x debug=0x%08x conblk=0x%08x dest=0x%08x)",
+                         cs, dcs, p->dma[(DMA_CH(p->chan) + DMA_DEBUG) / 4],
                      p->dma[(DMA_CH(p->chan) + DMA_CONBLK_AD) / 4], p->dma[(DMA_CH(p->chan) + DMA_DEST_AD) / 4]);
-                if (!(cs & SMI_CS_ACTIVE)) {
+                }
+                if (lost || !(dcs & DMA_CS_ACTIVE)) {
+                    /* Something stopped our channel: start over. */
+                    start_capture(p, c);
+                    rpos = 0;
+                    discont = true;
+                    atomic_fetch_add(&s->gaps, 1);
+                    LOGI("smi: capture restarted");
+                } else if (!(cs & SMI_CS_ACTIVE)) {
                     restart_smi(p);
                     discont = true;
                 }
@@ -500,7 +536,8 @@ static void smidma_close(source_t *s)
     g_smi_regs = g_dma_regs = NULL;
     vc_free(p, &p->ring);
     vc_free(p, &p->cbs);
-    unlink(HANDLE_FILE);
+    if (p->lock_fd >= 0)        /* still holding the lock: the file is ours */
+        unlink(HANDLE_FILE);
     if (p->smi)
         munmap((void *)p->smi, 4096);
     if (p->dma)
@@ -508,6 +545,7 @@ static void smidma_close(source_t *s)
     if (p->mem_fd >= 0) close(p->mem_fd);
     if (p->mbox_fd >= 0) close(p->mbox_fd);
     if (p->smi_fd >= 0) close(p->smi_fd);
+    if (p->lock_fd >= 0) close(p->lock_fd);
     free(p->tmp);
     free(p);
     s->priv = NULL;
@@ -536,10 +574,12 @@ int source_smidma_init(source_t *s)
     smidma_t *p = calloc(1, sizeof(*p));
     if (!p)
         return -1;
-    p->smi_fd = p->mem_fd = p->mbox_fd = -1;
+    p->smi_fd = p->mem_fd = p->mbox_fd = p->lock_fd = -1;
     p->chan = chan;
     s->priv = p;
     s->close_fn = smidma_close;
+    if (capture_lock(p))
+        goto fail;
 
     /* 1. Width, timing and DMA thresholds through the kernel driver. */
     p->smi_fd = open(c->smi_dev, O_RDWR);
