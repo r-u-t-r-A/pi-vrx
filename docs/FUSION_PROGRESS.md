@@ -38,7 +38,10 @@ ring -> reclock B -> sync-only decoder B -> fusion_push  > fusion thread -> one 
 | clicks 8/line | 7.3 / 3.2 | 6.4 / 2.9 | 3.8 / 2.0 |
 | 2 ms dips | 21.3 / 17.7 | 5.4 / 6.5 | 5.5 / 3.8 |
 
-CPU on the PC for 1.04 s of real video: one receiver 0.26 s, fuse 0.39-0.45 s, auto 0.60 s. Not measured on the Pi.
+CPU on the Zero 2W for 1.04 s of two-receiver video (2026-11-24, fuse, without capture and JPEG): 4.5 s before, 2.1 s after the
+fixed-point/NEON work; real-time run with web viewer: 59.9 fps, no skipped fields. `-v` prints CPU per thread at the end, `top -H`
+shows the thread names. When behind by more than 22 ms, whole fields are left out (status line: "CPU overload") instead of running
+late until the capture ring overruns (that was the slow-motion/jump effect in the web viewer).
 
 Tests: `test_pipeline` (all), `test_pipeline fuse`, `test_pipeline bench [case]`. ASan/UBSan/TSan clean (run in the ESP-IDF
 container, the host has no sanitizer runtime).
@@ -61,4 +64,4 @@ container, the host has no sanitizer runtime).
 ## Rules to keep
 
 - Do not touch the C5 serial port (`/dev/ttyACM0`) without asking: opening it can reset and hang the C5.
-- `c5div record` and `probe` on the Pi kill a running c5div's capture (shared DMA channel).
+- Only one c5div can capture (lock file). Stop the service before `record`/`probe`/a manual run, start it afterwards.

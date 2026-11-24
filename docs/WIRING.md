@@ -109,7 +109,7 @@ git clone https://github.com/r-u-t-r-A/pi-vrx && cd pi-vrx
 sudo ./pi/install.sh           # build, overlay, config.txt, service
 sudo reboot
 ls -l /dev/smi                 # must exist
-sudo c5div probe               # with both C5s running
+sudo systemctl stop c5div; sudo c5div probe   # with both C5s running
 ```
 
 `install.sh` adds this to `/boot/firmware/config.txt` (and makes a backup):

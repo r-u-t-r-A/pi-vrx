@@ -96,10 +96,10 @@ setting (EXPERIMENTAL → Clock Pin D10 = ON), and probe output.
 ```
 sudo ./pi/install.sh                    # deps, build, SMI overlay, config.txt, service
 sudo reboot
-sudo c5div probe                        # wiring and signal check
-sudo c5div run                          # HDMI + web viewer on :8080
+sudo systemctl stop c5div; sudo c5div probe   # wiring and signal check (then: start c5div)
+sudo systemctl stop c5div; sudo c5div run   # by hand: HDMI + web viewer
 sudo ./pi/setup-ap.sh MYSSID MYPASSWORD # optional: Wi-Fi AP at 192.168.50.1
-sudo systemctl enable --now c5div       # optional: start at boot (/etc/default/c5div)
+# c5div starts at boot; options in /etc/default/c5div
 sudo c5div record --seconds 5 -O cap.raw   # raw capture, replay with -s file:cap.raw
 ```
 
@@ -116,7 +116,7 @@ sudo c5div record --seconds 5 -O cap.raw   # raw capture, replay with -s file:ca
 - **Jumpers** (`-o jumpers`, the service default): a jumper on GPIO4 picks AV
   instead of HDMI and one on GPIO5 turns the web viewer on, also while
   running. See [docs/WIRING.md](docs/WIRING.md#output-jumpers).
-- **Web** (`-o web`): `/` is a fullscreen viewer with receiver status,
+- **Web** (`-o web`, ports 80 and 8080): `/` is a fullscreen viewer with receiver status,
   `/stream.mjpg` is plain MJPEG (also works in VLC/ffplay),
   `/snapshot.jpg`, and `/status.json`. Encoding only runs while someone
   watches, and slow clients skip frames instead of building latency.
