@@ -3,6 +3,6 @@
 # GPIO5-GND fitted = web viewer. Or fixed:
 #   HDMI only:            --output hdmi
 #   composite AV only:    --output av        (--av-std pal|ntsc to force a standard)
-#   Wi-Fi viewer only:    --output web --web-port 80
+#   Wi-Fi viewer only:    --output web
 #   one receiver:         --rx A
-C5DIV_ARGS="--source smi --output jumpers --web-port 80"
+C5DIV_ARGS="--source smi --output jumpers"

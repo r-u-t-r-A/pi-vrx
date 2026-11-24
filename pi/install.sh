@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install c5div on Raspberry Pi OS (Bookworm or later, Lite recommended).
 # Builds the binary, installs the SMI overlay, sets up config.txt
-# (with a backup) and installs the systemd service (not enabled).
+# (with a backup) and installs the systemd service, started at boot.
 #
 #   sudo ./pi/install.sh
 set -euo pipefail
@@ -29,16 +29,26 @@ dtc -@ -I dts -O dtb -o "$BOOT/overlays/c5div-smi.dtbo" "$HERE/pi/c5div-smi.dts"
 
 echo "== service"
 install -m 644 "$HERE/pi/c5div.service" /etc/systemd/system/c5div.service
-[ -f /etc/default/c5div ] || install -m 644 "$HERE/pi/c5div.default" /etc/default/c5div
+DEF=/etc/default/c5div
+# Options nobody changed (the first release's, or none): use the current ones.
+if [ ! -f "$DEF" ] || [ "$(grep '^C5DIV_ARGS=' "$DEF")" = 'C5DIV_ARGS="--source smi --output hdmi,web --web-port 80"' ]; then
+    [ -f "$DEF" ] && cp "$DEF" "$DEF.bak"
+    install -m 644 "$HERE/pi/c5div.default" "$DEF"
+else
+    echo "kept your $DEF (current defaults: pi/c5div.default)"
+fi
 systemctl daemon-reload
+systemctl enable c5div
+systemctl is-active -q c5div && systemctl restart c5div
 
 cat <<EOF
 
 Installed. Next:
   1. sudo reboot
   2. ls -l /dev/smi                  (must exist; see docs/WIRING.md if not)
-  3. sudo c5div probe                (wiring + signal check, C5s running)
-  4. sudo c5div run -o jumpers       (HDMI or AV, web viewer: by jumper)
-  5. optional Wi-Fi AP:  sudo ./pi/setup-ap.sh MYSSID MYPASSWORD
-  6. optional autostart: sudo systemctl enable --now c5div   (options in /etc/default/c5div)
+  3. sudo systemctl stop c5div; sudo c5div probe      (wiring + signal check, C5s running)
+  4. optional Wi-Fi AP:  sudo ./pi/setup-ap.sh MYSSID MYPASSWORD
+
+c5div starts at boot (options in /etc/default/c5div). To run it by hand, or
+probe/record, stop the service first: sudo systemctl stop c5div
 EOF

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Turn the Pi's Wi-Fi into an access point (NetworkManager, Raspberry Pi OS
-# Bookworm+). Phones/laptops join it and open http://192.168.50.1/ (or :8080).
+# Bookworm+). Phones/laptops join it and open http://192.168.50.1/.
 #
 #   sudo ./pi/setup-ap.sh SSID PASSWORD [CHANNEL] [--yes]
 #
@@ -49,5 +49,4 @@ nmcli con add type wifi ifname wlan0 con-name c5div-ap autoconnect yes ssid "$SS
 nmcli con up c5div-ap
 
 echo
-echo "Access point '$SSID' is up. Join it and open http://192.168.50.1:8080/"
-echo "(or http://192.168.50.1/ when the service runs with --web-port 80)"
+echo "Access point '$SSID' is up. Join it and open http://192.168.50.1/"
