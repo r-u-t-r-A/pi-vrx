@@ -1,0 +1,12 @@
+[Unit]
+Description=c5div dual C5VRX diversity video receiver
+After=network.target
+
+[Service]
+EnvironmentFile=-/etc/default/c5div
+ExecStart=/usr/local/bin/c5div run $C5DIV_ARGS
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

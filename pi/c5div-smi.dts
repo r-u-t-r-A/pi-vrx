@@ -1,0 +1,38 @@
+// c5div: enable the BCM283x Secondary Memory Interface (SMI) on just the
+// 12 data pins used by two C5VRX receivers. Use together with
+// dtoverlay=smi-dev (creates /dev/smi).
+//
+//   receiver A  bit0..5 -> SD0..SD5  = GPIO 8..13
+//   receiver B  bit0..5 -> SD8..SD13 = GPIO 16..21
+//
+// Unlike the stock "smi" overlay this leaves I2C (GPIO2/3), the UART
+// (GPIO14/15), GPIO6/7 and GPIO22..25 free. Data pins are pulled down so an
+// unconnected receiver reads as code 0.
+//
+// Build: dtc -@ -I dts -O dtb -o c5div-smi.dtbo c5div-smi.dts
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&gpio>;
+		__overlay__ {
+			c5div_smi_pins: c5div_smi_pins {
+				brcm,pins = <8 9 10 11 12 13 16 17 18 19 20 21>;
+				brcm,function = <5>;	/* ALT1 = SMI */
+				brcm,pull = <1>;	/* pull-down */
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&smi>;
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&c5div_smi_pins>;
+			status = "okay";
+		};
+	};
+};
