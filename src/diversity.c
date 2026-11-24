@@ -268,6 +268,7 @@ static void dequeue(diversity_t *dv, field_t *f)
 static void *combiner_thread(void *arg)
 {
     diversity_t *dv = arg;
+    thread_begin("combine");
     for (;;) {
         field_t *fa, *fb;
         int act;
@@ -321,6 +322,7 @@ static void *combiner_thread(void *arg)
         pthread_mutex_unlock(&dv->mu);
     }
     frame_pub_set_eof(dv->pub);
+    thread_end("combine");
     return NULL;
 }
 

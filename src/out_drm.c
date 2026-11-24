@@ -517,6 +517,7 @@ static void flip_handler(int fd, unsigned int seq, unsigned int sec, unsigned in
 static void *drm_thread(void *arg)
 {
     out_drm_t *o = arg;
+    thread_begin("drm");
     uint64_t seq = 0;
     double next_try = 0;
     drmEventContext ev = {.version = 2, .page_flip_handler = flip_handler};

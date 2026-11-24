@@ -6,7 +6,12 @@
 
 #include "common.h"
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 #define WIN 2560            /* samples per phase measurement (~0.1 ms, multiple of 5) */
+#define WIN_EVERY 4         /* measure one window in four: the clocks drift slowly */
 #define ALPHA_MIN 0.012     /* loop gain: averages over many slips of the stepwise phase */
 #define TAIL 4
 
@@ -71,12 +76,31 @@ static void measure(reclock_t *rc, const uint8_t *p, uint32_t n, uint64_t idx)
 {
     uint32_t cnt[5] = {0};
     const uint8_t *prev = p - 1;
+#ifdef __ARM_NEON
+    /* 80 = 5 x 16: byte lane l of vector v has residue (16 v + l) % 5 */
+    uint32_t i = 0;
+    while (i + 80 <= n) {
+        uint8x16_t acc[5] = {vdupq_n_u8(0), vdupq_n_u8(0), vdupq_n_u8(0), vdupq_n_u8(0), vdupq_n_u8(0)};
+        for (int r = 0; r < 255 && i + 80 <= n; r++, i += 80)
+            for (int v = 0; v < 5; v++)
+                acc[v] = vsubq_u8(acc[v], vceqq_u8(vld1q_u8(p + i + 16 * v), vld1q_u8(prev + i + 16 * v)));
+        for (int v = 0; v < 5; v++) {
+            uint8_t t[16];
+            vst1q_u8(t, acc[v]);
+            for (int l = 0; l < 16; l++)
+                cnt[(16 * v + l) % 5] += t[l];
+        }
+    }
+    for (; i < n; i++)
+        cnt[i % 5] += p[i] == prev[i];
+#else
     for (uint32_t j = 0; j < 5; j++) {
         uint32_t c = 0;
         for (uint32_t i = j; i < n; i += 5)
             c += p[i] == prev[i];
         cnt[j] = c;
     }
+#endif
     float re = 0, im = 0, tot = 0;
     static const float cs[5] = {1.0f, 0.309017f, -0.809017f, -0.809017f, 0.309017f};
     static const float sn[5] = {0.0f, 0.951057f, 0.587785f, -0.587785f, -0.951057f};
@@ -135,15 +159,19 @@ const uint8_t *reclock_feed(reclock_t *rc, const uint16_t *s, uint32_t n, uint64
         rc->out_cap = rc->cap;
         rc->out = realloc(rc->out, rc->out_cap);
     }
-    const int sh = rc->lane ? 8 : 0;
-    uint8_t *q = rc->buf + rc->len;
-    for (uint32_t i = 0; i < n; i++)
-        q[i] = (uint8_t)((s[i] >> sh) & 63);
+    uint8_t *restrict q = rc->buf + rc->len;
+    if (rc->lane)
+        for (uint32_t i = 0; i < n; i++)
+            q[i] = (uint8_t)((s[i] >> 8) & 63);
+    else
+        for (uint32_t i = 0; i < n; i++)
+            q[i] = (uint8_t)(s[i] & 63);
     const uint32_t fresh = rc->len;
     rc->len += n;
 
     /* Phase measurements over the new samples (first needs p[-1]). */
-    for (uint32_t w = fresh ? fresh : 5; w + WIN <= rc->len; w += WIN)
+    const uint32_t every = rc->nmeas < 300 ? 1 : WIN_EVERY;
+    for (uint32_t w = fresh ? fresh : 5; w + WIN <= rc->len; w += WIN * every)
         measure(rc, rc->buf + w, WIN, rc->base + w);
 
     /* Emit every code whose nearest sample is present. Within one block the
@@ -171,6 +199,23 @@ const uint8_t *reclock_feed(reclock_t *rc, const uint16_t *s, uint32_t n, uint64
         const uint64_t dp = (uint64_t)(step * 4294967296.0 + 0.5);
         const uint8_t *b = rc->buf;
         uint8_t *o = rc->out;
+        /* 12 codes come from 15 samples in one of four patterns, chosen by the
+         * grid phase (the drift inside 15 samples is far below one sample). */
+        static const uint8_t pat[4][16] = {
+            {0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 15, 15, 15},
+            {0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 14, 15, 15, 15, 15},
+            {0, 1, 3, 4, 5, 6, 8, 9, 10, 11, 13, 14, 15, 15, 15, 15},
+            {0, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14, 15, 15, 15, 15},
+        };
+        for (; m + 16 <= cnt && (ph >> 32) + 16 <= rc->len; m += 12, ph += 12 * dp) {
+            const uint8_t *src = b + (ph >> 32), *t = pat[(ph >> 30) & 3];
+#ifdef __ARM_NEON
+            vst1q_u8(o + m, vqtbl1q_u8(vld1q_u8(src), vld1q_u8(t)));
+#else
+            for (int k = 0; k < 12; k++)
+                o[m + (uint32_t)k] = src[t[k]];
+#endif
+        }
         for (; m < cnt; m++, ph += dp)
             o[m] = b[ph >> 32];
     }

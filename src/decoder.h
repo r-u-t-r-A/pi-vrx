@@ -56,7 +56,7 @@ typedef struct {
     _Atomic float sync_amp;         /* sync depth, DAC codes */
     _Atomic float blank;            /* blanking level, DAC codes */
     _Atomic float burst;            /* burst amplitude relative to nominal */
-    atomic_uint_fast64_t fields, lines, coasted, resyncs, lock_losses, vsync_flywheel, gaps;
+    atomic_uint_fast64_t fields, lines, coasted, resyncs, lock_losses, vsync_flywheel, fields_skipped, gaps;
     atomic_uint_fast64_t pulses_hsync, pulses_eq, pulses_broad, pulses_other, vsyncs, vsync_rejected;
 } decoder_stats_t;
 
@@ -91,6 +91,8 @@ void decoder_feed(decoder_t *d, const uint16_t *s, uint32_t n, uint64_t start, b
 void decoder_feed_u8(decoder_t *d, const uint8_t *s, uint32_t n, uint64_t start, bool discont);
 /* The next three are for the thread that feeds the decoder. */
 void decoder_get_timing(const decoder_t *d, decoder_timing_t *t);
+/* Behind real time: do not decode fields that start from now on. */
+void decoder_set_skip(decoder_t *d, bool skip);
 /* Lines processed since the last call (oldest first); returns the count. */
 int decoder_take_lines(decoder_t *d, decoder_line_t out[DECODER_LINES]);
 /* Published positions (field start/end, progress) = scale * index + offset:
