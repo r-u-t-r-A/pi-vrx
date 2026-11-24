@@ -1,4 +1,8 @@
-/* HDMI output via DRM/KMS atomic modesetting (vc4 on the Pi).
+/* HDMI or composite AV output via DRM/KMS atomic modesetting (vc4 on the Pi).
+ *
+ * AV uses the analog TV encoder at 13.5 MHz, 720 pixels per line: the grid the
+ * decoder resamples to, so pixels pass through 1:1. The standard follows the
+ * camera (576i50 PAL / 480i60 NTSC) unless forced.
  *
  * Prefers a YUV420 framebuffer so the hardware scaler (HVS) does colour
  * conversion and scaling for free; falls back to XRGB8888 with CPU
@@ -52,6 +56,12 @@ struct out_drm {
 
     uint32_t p_fb_id, p_crtc_id, p_src_x, p_src_y, p_src_w, p_src_h, p_crtc_x, p_crtc_y, p_crtc_w, p_crtc_h;
     uint32_t c_conn_crtc, c_mode_id, c_active;
+    uint32_t c_tv_mode;         /* AV: colour standard property and value */
+    uint64_t tv_mode;
+    struct { uint32_t conn, prop; } steal[8];   /* connectors to take off our CRTC */
+    int nsteal;
+    const char *name;
+    int std_diff;               /* consecutive frames of another standard */
 
     frame_t tmp;
     uint64_t flips, busy;
@@ -162,6 +172,10 @@ static int commit(out_drm_t *o, int bi, uint32_t flags, bool modeset)
     if (!req)
         return -ENOMEM;
     if (modeset) {
+        for (int i = 0; i < o->nsteal; i++)
+            drmModeAtomicAddProperty(req, o->steal[i].conn, o->steal[i].prop, 0);
+        if (o->c_tv_mode)
+            drmModeAtomicAddProperty(req, o->conn_id, o->c_tv_mode, o->tv_mode);
         drmModeAtomicAddProperty(req, o->conn_id, o->c_conn_crtc, o->crtc_id);
         drmModeAtomicAddProperty(req, o->crtc_id, o->c_mode_id, o->mode_blob);
         drmModeAtomicAddProperty(req, o->crtc_id, o->c_active, 1);
@@ -181,8 +195,54 @@ static int commit(out_drm_t *o, int bi, uint32_t flags, bool modeset)
     return ret;
 }
 
+static bool is_analog(uint32_t type)
+{
+    return type == DRM_MODE_CONNECTOR_Composite || type == DRM_MODE_CONNECTOR_SVIDEO || type == DRM_MODE_CONNECTOR_TV;
+}
+
+/* Value of an enum property of the connector, by name. */
+static bool enum_value(int fd, uint32_t prop, const char *name, uint64_t *value)
+{
+    drmModePropertyRes *p = drmModeGetProperty(fd, prop);
+    bool ok = false;
+    for (int i = 0; p && i < p->count_enums && !ok; i++)
+        if (!strcmp(p->enums[i].name, name)) {
+            *value = p->enums[i].value;
+            ok = true;
+        }
+    drmModeFreeProperty(p);
+    return ok;
+}
+
+/* AV: the 13.5 MHz mode and the colour standard must belong together. */
+static bool pick_av_mode(out_drm_t *o, drmModeConnector *c, video_std_t std)
+{
+    const bool pal = std != STD_NTSC;
+    const int want_h = (pal ? 576 : 480) / (o->cfg.av_progressive ? 2 : 1);
+    for (int i = 0; i < c->count_modes; i++) {
+        const drmModeModeInfo *m = &c->modes[i];
+        if (m->hdisplay == 720 && m->vdisplay == want_h && m->htotal == (pal ? 864 : 858) &&
+            !(m->flags & DRM_MODE_FLAG_INTERLACE) == o->cfg.av_progressive) {
+            o->mode = *m;
+            o->c_tv_mode = prop_id(o->fd, o->conn_id, DRM_MODE_OBJECT_CONNECTOR, "TV mode", NULL);
+            if (!o->c_tv_mode)      /* kernels before 6.2 */
+                o->c_tv_mode = prop_id(o->fd, o->conn_id, DRM_MODE_OBJECT_CONNECTOR, "mode", NULL);
+            if (!o->c_tv_mode || !enum_value(o->fd, o->c_tv_mode, pal ? "PAL" : "NTSC", &o->tv_mode)) {
+                LOGW("av: no TV standard property, output may be in the wrong colour system");
+                o->c_tv_mode = 0;
+            }
+            return true;
+        }
+    }
+    LOGE("av: the driver offers no %s mode", pal ? "PAL" : "NTSC");
+    return false;
+}
+
 static bool pick_mode(out_drm_t *o, drmModeConnector *c, int W, int H, video_std_t std)
 {
+    o->c_tv_mode = 0;
+    if (o->cfg.av)
+        return pick_av_mode(o, c, o->cfg.av_std != STD_UNKNOWN ? o->cfg.av_std : std);
     int mw = 0, mh = 0, mr = 0;
     if (o->cfg.mode && strcmp(o->cfg.mode, "auto") != 0 && sscanf(o->cfg.mode, "%dx%d@%d", &mw, &mh, &mr) >= 2) {
         for (int i = 0; i < c->count_modes; i++) {
@@ -237,14 +297,18 @@ static int setup(out_drm_t *o, int W, int H, video_std_t std)
         }
         for (int c = 0; c < res->count_connectors && !conn; c++) {
             drmModeConnector *cc = drmModeGetConnector(fd, res->connectors[c]);
-            if (cc && cc->connection == DRM_MODE_CONNECTED && cc->count_modes > 0)
+            /* Nothing can detect an analog monitor: its status is "unknown". */
+            const bool ok = cc && cc->count_modes > 0 &&
+                            (o->cfg.av ? is_analog(cc->connector_type) && cc->connection != DRM_MODE_DISCONNECTED
+                                       : !is_analog(cc->connector_type) && cc->connection == DRM_MODE_CONNECTED);
+            if (ok)
                 conn = cc;
             else if (cc)
                 drmModeFreeConnector(cc);
         }
         if (conn) {
             o->fd = fd;
-            LOGI("hdmi: using %s", path);
+            LOGI("%s: using %s", o->name, path);
         } else {
             drmModeFreeResources(res);
             res = NULL;
@@ -252,7 +316,10 @@ static int setup(out_drm_t *o, int W, int H, video_std_t std)
         }
     }
     if (!conn) {
-        LOGD("hdmi: no connected display");
+        if (o->cfg.av)
+            LOGW("av: no composite connector (config.txt needs dtoverlay=vc4-kms-v3d,composite)");
+        else
+            LOGD("hdmi: no connected display");
         return -1;
     }
     int rc = -1;
@@ -285,8 +352,20 @@ static int setup(out_drm_t *o, int W, int H, video_std_t std)
         if (res->crtcs[k] == o->crtc_id)
             o->crtc_idx = k;
     if (o->crtc_idx < 0) {
-        LOGE("hdmi: no CRTC for connector");
+        LOGE("drm: no CRTC for connector");
         goto out;
+    }
+
+    /* HDMI and AV share a CRTC: take it away from the other one. */
+    o->nsteal = 0;
+    for (int c = 0; c < res->count_connectors && o->nsteal < 8; c++) {
+        uint64_t on = 0;
+        const uint32_t id = res->connectors[c];
+        const uint32_t prop = prop_id(o->fd, id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID", &on);
+        if (id != o->conn_id && prop && on == o->crtc_id) {
+            o->steal[o->nsteal].conn = id;
+            o->steal[o->nsteal++].prop = prop;
+        }
     }
 
     /* Plane: primary with YUV420 preferred, then primary with XRGB8888. */
@@ -317,7 +396,7 @@ static int setup(out_drm_t *o, int W, int H, video_std_t std)
     if (pres)
         drmModeFreePlaneResources(pres);
     if (best_score < 0) {
-        LOGE("hdmi: no usable plane");
+        LOGE("drm: no usable plane");
         goto out;
     }
     o->plane_id = best;
@@ -339,7 +418,7 @@ static int setup(out_drm_t *o, int W, int H, video_std_t std)
 
     if (create_buffers(o, W, H)) {
         if (o->yuv) {
-            LOGW("hdmi: YUV420 framebuffer failed, using XRGB8888");
+            LOGW("drm: YUV420 framebuffer failed, using XRGB8888");
             for (int i = 0; i < NBUF; i++) {
                 if (o->buf[i].fb) drmModeRmFB(o->fd, o->buf[i].fb);
                 if (o->buf[i].map) munmap(o->buf[i].map, o->buf[i].size);
@@ -359,7 +438,8 @@ static int setup(out_drm_t *o, int W, int H, video_std_t std)
 
     /* Destination rectangle */
     int MW = o->mode.hdisplay, MH = o->mode.vdisplay;
-    if (o->cfg.stretch) {
+    /* 720-pixel SD modes are 4:3 as a whole (their pixels are not square). */
+    if (o->cfg.stretch || o->cfg.av || (MW == 720 && (MH == 576 || MH == 480))) {
         o->dx = o->dy = 0;
         o->dw = MW;
         o->dh = MH;
@@ -379,13 +459,14 @@ static int setup(out_drm_t *o, int W, int H, video_std_t std)
         goto out;
     int ret = commit(o, 0, DRM_MODE_ATOMIC_ALLOW_MODESET, true);
     if (ret) {
-        LOGE("hdmi: modeset failed: %s", strerror(-ret));
+        LOGE("%s: modeset failed: %s", o->name, strerror(-ret));
         goto out;
     }
     o->front = 0;
     o->ready = true;
-    LOGI("hdmi: %dx%d@%u, %s plane, picture %dx%d -> %dx%d+%d+%d", MW, MH, o->mode.vrefresh,
-         o->yuv ? "YUV420" : "XRGB8888", W, H, o->dw, o->dh, o->dx, o->dy);
+    o->std_diff = 0;
+    LOGI("%s: %dx%d%s@%u, %s plane, picture %dx%d -> %dx%d+%d+%d", o->name, MW, MH,
+         o->mode.flags & DRM_MODE_FLAG_INTERLACE ? "i" : "", o->mode.vrefresh, o->yuv ? "YUV420" : "XRGB8888", W, H, o->dw, o->dh, o->dx, o->dy);
     rc = 0;
 out:
     drmModeFreeConnector(conn);
@@ -452,8 +533,14 @@ static void *drm_thread(void *arg)
                 break;
             continue;
         }
-        if (o->ready && (o->tmp.w != o->fw || o->tmp.h != o->fh))
-            teardown(o);   /* standard changed: rebuild */
+        if (o->ready && (o->tmp.w != o->fw || o->tmp.h != o->fh)) {
+            /* Standard changed: rebuild, but not on a short misdetection (an
+             * analog monitor takes a second to re-sync). */
+            if (++o->std_diff < 20)
+                continue;
+            teardown(o);
+        }
+        o->std_diff = 0;
         if (!o->ready) {
             if (now_s() < next_try)
                 continue;
@@ -471,7 +558,7 @@ static void *drm_thread(void *arg)
         } else if (ret == -EBUSY) {
             o->busy++;
         } else {
-            LOGW("hdmi: commit failed (%s), re-initialising", strerror(-ret));
+            LOGW("%s: commit failed (%s), re-initialising", o->name, strerror(-ret));
             teardown(o);
             next_try = now_s() + 1.0;
         }
@@ -487,6 +574,7 @@ out_drm_t *out_drm_start(const drm_cfg_t *cfg, frame_pub_t *pub)
     if (!o)
         return NULL;
     o->cfg = *cfg;
+    o->name = cfg->av ? "av" : "hdmi";
     o->pub = pub;
     o->fd = -1;
     if (frame_alloc(&o->tmp)) {
@@ -499,7 +587,7 @@ out_drm_t *out_drm_start(const drm_cfg_t *cfg, frame_pub_t *pub)
         free(o);
         return NULL;
     }
-    LOGI("hdmi output enabled (mode %s)", cfg->mode ? cfg->mode : "auto");
+    LOGI("%s output enabled", o->name);
     return o;
 }
 
