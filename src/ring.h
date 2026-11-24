@@ -62,3 +62,5 @@ void ring_remove_consumer(ring_t *r, int id);
  * *overrun is set. The block stays valid until ring_release(). */
 ring_status_t ring_next(ring_t *r, int id, const ring_block_t **out, bool *overrun, int timeout_ms);
 void ring_release(ring_t *r, int id);
+/* Blocks waiting for this consumer. */
+uint32_t ring_backlog(ring_t *r, int id);

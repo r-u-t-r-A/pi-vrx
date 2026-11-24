@@ -40,13 +40,15 @@ fusion_t *fusion_new(decoder_t *main_dec);
 void fusion_free(fusion_t *f);
 
 /* Receiver thread, after feeding `dec` with these codes. Blocks while the
- * queue is full. */
+ * queue is full. late: this block is behind real time, skip decoding fields. */
 void fusion_push(fusion_t *f, int lane, decoder_t *dec, const uint8_t *codes, uint32_t n, uint64_t k0,
-                 const reclock_state_t *st, uint64_t cap_start, bool discont);
+                 const reclock_state_t *st, uint64_t cap_start, bool discont, bool late);
 void fusion_eof(fusion_t *f, int lane);
 
 /* Fusion thread: wait for and process one block; false at the end. */
 bool fusion_step(fusion_t *f);
+/* Decoder thread: wait for and decode one fused block; false at the end. */
+bool fusion_decode_step(fusion_t *f);
 
 fusion_stats_t *fusion_stats(fusion_t *f);
 
