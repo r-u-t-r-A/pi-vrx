@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <linux/sockios.h>
@@ -34,7 +35,7 @@
 struct out_http {
     http_cfg_t cfg;
     frame_pub_t *pub;
-    int lfd;
+    int lfd[2], nlfd;
     pthread_t th_accept, th_enc;
     atomic_bool run;
     pthread_mutex_t mu;
@@ -136,6 +137,8 @@ static int encode_jpeg(const frame_t *f, int quality, uint8_t **out, size_t *out
 static void *enc_thread(void *arg)
 {
     out_http_t *o = arg;
+    thread_begin("jpeg");
+    setpriority(PRIO_PROCESS, (id_t)gettid(), 5);   /* decoding goes first */
     uint64_t fseq = 0;
     double last = 0;
     while (atomic_load(&o->run)) {
@@ -319,10 +322,10 @@ static void *accept_thread(void *arg)
 {
     out_http_t *o = arg;
     while (atomic_load(&o->run)) {
-        struct pollfd p = {.fd = o->lfd, .events = POLLIN};
-        if (poll(&p, 1, 200) <= 0)
+        struct pollfd p[2] = {{.fd = o->lfd[0], .events = POLLIN}, {.fd = o->lfd[1], .events = POLLIN}};
+        if (poll(p, (nfds_t)o->nlfd, 200) <= 0)
             continue;
-        int fd = accept(o->lfd, NULL, NULL);
+        int fd = accept(p[0].revents ? o->lfd[0] : o->lfd[1], NULL, NULL);
         if (fd < 0)
             continue;
         if (atomic_load(&o->clients) >= 16) {
@@ -347,6 +350,24 @@ static void *accept_thread(void *arg)
     return NULL;
 }
 
+static int listen_on(int port)
+{
+    const int fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    int one = 1, zero = 0;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
+    struct sockaddr_in6 a = {.sin6_family = AF_INET6, .sin6_port = htons((uint16_t)port), .sin6_addr = in6addr_any};
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) || listen(fd, 8)) {
+        const int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
 out_http_t *out_http_start(const http_cfg_t *cfg, frame_pub_t *pub)
 {
     out_http_t *o = calloc(1, sizeof(*o));
@@ -354,7 +375,7 @@ out_http_t *out_http_start(const http_cfg_t *cfg, frame_pub_t *pub)
         return NULL;
     o->cfg = *cfg;
     if (o->cfg.fps <= 0)
-        o->cfg.fps = 25;
+        o->cfg.fps = 30;
     if (o->cfg.quality <= 0)
         o->cfg.quality = 70;
     o->pub = pub;
@@ -363,22 +384,31 @@ out_http_t *out_http_start(const http_cfg_t *cfg, frame_pub_t *pub)
     if (frame_alloc(&o->fr))
         goto fail;
 
-    o->lfd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (o->lfd < 0)
-        goto fail;
-    int one = 1, zero = 0;
-    setsockopt(o->lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    setsockopt(o->lfd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
-    struct sockaddr_in6 a = {.sin6_family = AF_INET6, .sin6_port = htons((uint16_t)cfg->port), .sin6_addr = in6addr_any};
-    if (bind(o->lfd, (struct sockaddr *)&a, sizeof(a)) || listen(o->lfd, 8)) {
-        LOGE("web: cannot listen on port %d: %s", cfg->port, strerror(errno));
-        close(o->lfd);
+    /* port 0: the plain address and the familiar :8080, whichever can be had */
+    const int ports[2] = {cfg->port ? cfg->port : 80, cfg->port ? 0 : 8080};
+    o->nlfd = 0;
+    char list[32] = "";
+    for (int i = 0; i < 2; i++) {
+        if (!ports[i])
+            continue;
+        const int fd = listen_on(ports[i]);
+        if (fd < 0) {
+            if (cfg->port)
+                LOGE("web: cannot listen on port %d: %s", ports[i], strerror(errno));
+            continue;
+        }
+        o->lfd[o->nlfd++] = fd;
+        snprintf(list + strlen(list), sizeof(list) - strlen(list), "%s%d", list[0] ? " and " : "", ports[i]);
+    }
+    if (!o->nlfd) {
+        if (!cfg->port)
+            LOGE("web: ports 80 and 8080 are both unavailable: %s", strerror(errno));
         goto fail;
     }
     atomic_store(&o->run, true);
     pthread_create(&o->th_enc, NULL, enc_thread, o);
     pthread_create(&o->th_accept, NULL, accept_thread, o);
-    LOGI("web output: http://<this-host>:%d/  (MJPEG %d fps max, quality %d)", cfg->port, o->cfg.fps,
+    LOGI("web output: http://<this-host>/ on port %s  (MJPEG %d fps max, quality %d)", list, o->cfg.fps,
          o->cfg.quality);
     return o;
 fail:
@@ -397,7 +427,8 @@ void out_http_stop(out_http_t *o)
     pthread_mutex_unlock(&o->mu);
     pthread_join(o->th_accept, NULL);
     pthread_join(o->th_enc, NULL);
-    close(o->lfd);
+    for (int i = 0; i < o->nlfd; i++)
+        close(o->lfd[i]);
     /* Detached client threads notice run=false within ~2 s; give them a moment. */
     for (int i = 0; i < 30 && atomic_load(&o->clients) > 0; i++)
         usleep(100000);

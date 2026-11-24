@@ -7,6 +7,8 @@
 
 #include "common.h"
 
+#include "vec16.h"
+
 #define GRID_PRE 72                 /* pixels before active start (covers burst) */
 #define GRID_POST 16
 #define GRID_N (GRID_PRE + OUT_W + GRID_POST)
@@ -23,12 +25,14 @@ enum { ST_ACQ = 0, ST_LOCK = 1 };
 
 #define JOBQ 64
 #define MAX_WORKERS 4
+#define JOB_BATCH 4     /* lines a worker takes at once */
 
 /* Scratch for decoding one line (one per worker, one for inline use). */
 typedef struct {
     float v[GRID_N], zr[GRID_N], zi[GRID_N], lc[GRID_N], ls[GRID_N];
     float Cr[OUT_W], Ci[OUT_W], U[OUT_W], V[OUT_W];
     float Pr[GRID_N + 2], Pi[GRID_N + 2], Qr[GRID_N + 2], Qi[GRID_N + 2];
+    int16_t xv[GRID_N], xa[GRID_N], xb[GRID_N], xs[GRID_N];     /* fixed-point path */
     float *fl;
 } line_work_t;
 
@@ -143,6 +147,7 @@ struct decoder {
     size_t raw_cap;
     unsigned q_tail, q_next, q_ready;
     int pending;
+    bool q_waiting;            /* the decoder thread waits on q_done */
     bool q_stop;
     pthread_mutex_t q_mu;
     pthread_cond_t q_job, q_done;
@@ -154,6 +159,11 @@ struct decoder {
     float lpf[LPF_TAPS];
     float rs[RS_PH + 1][RS_TAPS];
     float sr[RS_PH + 1][SR_TAPS];
+    int16_t srq[RS_PH + 1][SR_TAPS];      /* the same, Q14 */
+    int16_t lq_tc[GRID_N], lq_ts[GRID_N]; /* lo_tc, lo_ts in Q15 */
+    uint16_t *bx;                         /* slicer scratch: box sums */
+    size_t bx_cap;
+    bool skip_fields;                     /* behind real time: do not decode the next field */
     bool clean;                           /* input is one sample per C5 code */
     float pf_a, pf_b;                     /* fast-path prefilter taps [b a b] */
     float lo_tc[GRID_N], lo_ts[GRID_N];   /* cos/sin(j * dphi) for the current standard */
@@ -205,6 +215,8 @@ static void set_std(decoder_t *d, video_std_t s, double idx)
     for (int j = 0; j < GRID_N; j++) {
         d->lo_tc[j] = (float)cos(j * dph);
         d->lo_ts[j] = (float)sin(j * dph);
+        d->lq_tc[j] = (int16_t)lrint(32767.0 * cos(j * dph));
+        d->lq_ts[j] = (int16_t)lrint(32767.0 * sin(j * dph));
     }
     atomic_store(&d->st.std, (int)s);
 }
@@ -296,11 +308,11 @@ static uint64_t keep_from(const decoder_t *d)
 static void compact(decoder_t *d)
 {
     uint64_t k = keep_from(d);
-    size_t shift = (size_t)(k - d->base);
+    size_t shift = (size_t)(k - d->base) & ~(size_t)3;   /* quad slicer: keep 4-alignment */
     if (shift == 0)
         return;
     if (shift > d->len)
-        shift = d->len;
+        shift = d->len & ~(size_t)3;
     memmove(d->hb, d->hb + shift, d->len - shift);
     d->len -= shift;
     d->base += shift;
@@ -365,6 +377,11 @@ static void start_field(decoder_t *d, double vs, int parity, double k0, bool syn
     d->have_k0 = true;
     d->k0 = k0;
     d->parity = parity;
+    if (d->skip_fields) {
+        d->fld = NULL;
+        atomic_fetch_add(&d->st.fields_skipped, 1);
+        return;
+    }
     field_t *f = d->sink.acquire ? d->sink.acquire(d->sink.ctx, d->id) : NULL;   /* NULL: sync-only */
     d->fld = f;
     if (!f)
@@ -565,6 +582,97 @@ static double find_cross(const uint8_t *hb, size_t i, int32_t s, int nb, int32_t
 
 /* Box-filtered Schmitt trigger. Tight scan loops; the exact crossing is
  * only worked out (backwards) when a transition is found. */
+/* Slicer on sums of 4 samples (20 MS/s input, 0.6 us box = 3 quads): the box
+ * sum at every 4th sample, scanned for threshold crossings with a vector
+ * search. Crossings fall on the box's linear ramp, so interpolating between
+ * every 4th value loses nothing. scan stays a multiple of 4 from base. */
+static size_t first_below(const uint16_t *b, size_t i, size_t n, int32_t T)
+{
+#ifdef __ARM_NEON
+    const uint16x8_t t = vdupq_n_u16((uint16_t)clampi(T, 0, 65535));
+    for (; i + 16 <= n; i += 16)
+        if (vmaxvq_u16(vorrq_u16(vcltq_u16(vld1q_u16(b + i), t), vcltq_u16(vld1q_u16(b + i + 8), t))))
+            break;
+#endif
+    while (i < n && b[i] >= T)
+        i++;
+    return i;
+}
+
+static size_t first_above(const uint16_t *b, size_t i, size_t n, int32_t T)
+{
+#ifdef __ARM_NEON
+    const uint16x8_t t = vdupq_n_u16((uint16_t)clampi(T, 0, 65535));
+    for (; i + 8 <= n; i += 8)
+        if (vmaxvq_u16(vcgtq_u16(vld1q_u16(b + i), t)))
+            break;
+#endif
+    while (i < n && b[i] <= T)
+        i++;
+    return i;
+}
+
+static void slice4(decoder_t *d)
+{
+    const int32_t T = (int32_t)lrintf(d->thr * d->nb);
+    const int32_t Hy = (int32_t)lrintf(hysteresis(d) * d->nb);
+    const double corr = 0.5 * (d->nb - 1);
+    size_t q0 = (size_t)(d->scan - d->base + 3) / 4;
+    const size_t q1 = d->len / 4;
+    if (!d->sum_ok) {
+        if (q1 < 3) {
+            return;
+        }
+        if (q0 < 2)
+            q0 = 2;
+        d->sum_ok = true;
+        d->low = false;
+    }
+    if (q0 >= q1)
+        return;
+    /* bx[k] = box sum ending with quad q0 - BACK + k; BACK quads of history
+     * for walking back to the crossing. */
+    const size_t back = q0 - 2 < 24 ? q0 - 2 : 24;
+    const size_t f = q0 - back, n = q1 - f;
+    if (d->bx_cap < n + 8) {
+        d->bx_cap = n + 8192;
+        d->bx = realloc(d->bx, 2 * d->bx_cap * sizeof(uint16_t));
+    }
+    uint16_t *restrict b = d->bx, *restrict u = d->bx + d->bx_cap;
+    const uint8_t *restrict x = d->hb + 4 * (f - 2);
+    for (size_t k = 0; k < n + 2; k++)
+        u[k] = (uint16_t)(x[4 * k] + x[4 * k + 1] + x[4 * k + 2] + x[4 * k + 3]);
+    for (size_t k = 0; k < n; k++)
+        b[k] = (uint16_t)(u[k] + u[k + 1] + u[k + 2]);
+
+    const double org = (double)d->base + 4.0 * (double)f + 3.0 - corr;   /* sample position of b[0], centred */
+    size_t i = back;
+    while (i < n) {
+        const bool falling = !d->low;
+        i = falling ? first_below(b, i, n, T - Hy) : first_above(b, i, n, T + Hy);
+        if (i >= n)
+            break;
+        size_t k = i;
+        while (k > 0 && (falling ? b[k] < T : b[k] > T))
+            k--;
+        const int32_t e = (int32_t)b[k] - b[k + 1 < n ? k + 1 : k];
+        const double pos = org + 4.0 * ((double)k + (e ? clampf((float)(b[k] - T) / (float)e, 0.0f, 1.0f) : 0.0f));
+        if (falling) {
+            d->cur_fall = pos;
+            d->low = true;
+        } else {
+            d->low = false;
+            got_pulse(d, d->cur_fall, pos);
+        }
+        i++;
+    }
+    d->scan = d->base + 4 * q1;
+    if (d->have_pend && !d->low && (double)d->scan - corr > d->pend.rise + merge_gap(d)) {
+        emit_pulse(d, d->pend);
+        d->have_pend = false;
+    }
+}
+
 static void slice(decoder_t *d)
 {
     const uint64_t end = d->base + d->len;
@@ -664,8 +772,143 @@ static void hist_threshold(decoder_t *d)
 /* ------------------------------------------------------------ colour/active */
 
 /* Worker side: resample, demodulate and write one line of the field. */
+static inline int16_t sat16(int32_t v) { return (int16_t)(v < -32768 ? -32768 : v > 32767 ? 32767 : v); }
+static inline int16_t satf(float v) { return (int16_t)lrintf(clampf(v, -32767.0f, 32767.0f)); }
+
+/* Codes (one per C5 code, 20 MS/s) onto the 13.5 MHz grid: sh-scaled codes
+ * minus blanking, in int16. */
+static void resample_fx(const decoder_t *d, const uint8_t *restrict raw, int32_t pos, int32_t step, int shift, int32_t off,
+                        int16_t *restrict out)
+{
+    int j = 0;
+#ifdef __ARM_NEON
+    const int32x4_t vsh = vdupq_n_s32(-shift), voff = vdupq_n_s32(off);
+#define PROD(k)                                                                                        \
+    const int32_t p##k = pos + (k) * step;                                                             \
+    const int16x8_t x##k = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(raw + (p##k >> 20) - (SR_TAPS / 2 - 1)))); \
+    const int16x8_t h##k = vld1q_s16(d->srq[((p##k & 0xFFFFF) + (1 << 13)) >> 14]);                    \
+    const int32x4_t a##k = vmlal_high_s16(vmull_s16(vget_low_s16(x##k), vget_low_s16(h##k)), x##k, h##k)
+    for (; j + 4 <= GRID_N; j += 4, pos += 4 * step) {
+        PROD(0);
+        PROD(1);
+        PROD(2);
+        PROD(3);
+        const int32x4_t sum = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
+        vst1_s16(out + j, vqmovn_s32(vsubq_s32(vshlq_s32(sum, vsh), voff)));
+    }
+#undef PROD
+#endif
+    for (; j < GRID_N; j++, pos += step) {
+        const uint8_t *x = raw + (pos >> 20) - (SR_TAPS / 2 - 1);
+        const int16_t *h = d->srq[((pos & 0xFFFFF) + (1 << 13)) >> 14];
+        int32_t acc = 0;
+        for (int k = 0; k < SR_TAPS; k++)
+            acc += (int32_t)h[k] * x[k];
+        out[j] = sat16((acc >> shift) - off);
+    }
+}
+
+/* Sum of CL = 9 neighbours, centred, halved (rounded) if asked to. In place is
+ * not possible. Ranges are multiples of 8. */
+static void box_fx(const int16_t *restrict in, int16_t *restrict out, int g0, int g1, int half)
+{
+    for (int g = g0; g < g1; g += 8) {
+        const int16_t *p = in + g - CL / 2;
+#ifdef __ARM_NEON
+        /* 16 inputs at once: the other seven windows come from shifting */
+        const int16x8_t a = vld1q_s16(p), b = vld1q_s16(p + 8);
+        int16x8_t s = vaddq_s16(vaddq_s16(a, b), vextq_s16(a, b, 1));
+        s = vaddq_s16(s, vaddq_s16(vextq_s16(a, b, 2), vextq_s16(a, b, 3)));
+        s = vaddq_s16(s, vaddq_s16(vextq_s16(a, b, 4), vextq_s16(a, b, 5)));
+        s = vaddq_s16(s, vaddq_s16(vextq_s16(a, b, 6), vextq_s16(a, b, 7)));
+        vst1q_s16(out + g, half ? vrshrq_n_s16(s, 1) : s);
+#else
+        v8s s = v8_load(p);
+        for (int k = 1; k < CL; k++)
+            s += v8_load(p + k);
+        v8_store(out + g, half ? (s + 1) >> 1 : s);
+#endif
+    }
+}
+
+/* One active line in fixed point, for clean 20 MS/s codes. v is in Q12 of
+ * peak white. The LO is the fixed per-standard table; the line's phase is
+ * applied once, in the chroma output matrix (A = 2 LPF(v cos), B = 2 LPF(v sin)). */
+static void run_line_job_fx(const decoder_t *d, const line_job_t *jb, line_work_t *w)
+{
+    /* Q6 or Q8 codes, so that the gain to Q12 stays below one. */
+    const int qb = d->code_max > 63 ? 6 : 8;
+    resample_fx(d, jb->raw + 1, (int32_t)lrintf(jb->x0 * 1048576.0f), (int32_t)lrint((double)jb->dx * 1048576.0), 14 - qb,
+                (int32_t)lrintf(jb->bl * (float)(1 << qb)), w->xv);
+    int16_t *restrict v = w->xv;
+    const v8s G = v8_dup(satf(jb->gain * 4096.0f / (float)(1 << qb) * 32768.0f));
+    for (int j = 0; j < GRID_N; j += 8)
+        v8_store(v + j, v8_mulr(v8_load(v + j), G));
+
+    uint8_t *restrict Y = jb->fld->y[jb->row];
+    const v8s ky = v8_dup(satf(jb->ys * 8.0f / 4096.0f * 32768.0f)), yo = v8_dup((int)lrintf(jb->yo * 8.0f + 4.0f));
+    uint8_t *CB = jb->fld->cb[jb->row], *CR = jb->fld->cr[jb->row];
+    if (!jb->sub) {
+        for (int j = 0; j < OUT_W; j += 8)
+            v8_store_u8(Y + j, (v8_mulr(v8_load(v + j + GRID_PRE), ky) + yo) >> 3);
+        memset(CB, 128, OUT_CW);
+        memset(CR, 128, OUT_CW);
+        jb->fld->q[jb->row] = jb->q;
+        return;
+    }
+
+    /* Demodulate (Q8) and low-pass: two running sums of CL pixels. */
+    const int16_t *restrict tc = d->lq_tc, *restrict ts = d->lq_ts;
+    const int h = CL / 2, g0 = GRID_PRE, g1 = GRID_PRE + OUT_W;
+    int16_t *restrict xs = w->xs, *restrict xa = w->xa, *restrict xb = w->xb;
+    for (int pass = 0; pass < 2; pass++) {
+        const int16_t *restrict t = pass ? ts : tc;
+        int16_t *restrict o = pass ? xb : xa;
+        for (int g = g0 - 2 * h; g < g1 + 2 * h; g += 8)
+            v8_store(o + g, (v8_mulr(v8_load(v + g), v8_load(t + g)) + 8) >> 4);
+        box_fx(o, xs, g0 - h, g1 + h, 1);
+        box_fx(xs, o, g0, g1, 0);
+        for (int g = g0; g < g1; g += 8)        /* 2 LPF in Q12: x 64/81 */
+            v8_store(o + g, v8_mulr(v8_load(o + g), v8_dup(25891)));
+    }
+
+    /* Luma by chroma remodulation/subtraction. */
+    for (int g = g0; g < g1; g += 8) {
+        const v8s dv = v8_load(v + g) - v8_mulr(v8_load(xa + g), v8_load(tc + g)) - v8_mulr(v8_load(xb + g), v8_load(ts + g));
+        v8_store_u8(Y + g - g0, (v8_mulr(dv, ky) + yo) >> 3);
+    }
+    if (jb->colour) {
+        /* U/V from the burst-locked reference (rot = j conj(R)), PAL switch, ACC. */
+        const float c0 = jb->c0, s0 = jb->s0, rre = jb->rot_re, rim = jb->rot_im, acc = jb->acc;
+        const int16_t ua = satf(acc * (rre * s0 - rim * c0) * 256.9f * 8.0f), ub = satf(acc * (rim * s0 + rre * c0) * 256.9f * 8.0f);
+        const int16_t va = satf(acc * jb->sw * (rre * c0 + rim * s0) * 182.2f * 8.0f);
+        const int16_t vb = satf(acc * jb->sw * (rim * c0 - rre * s0) * 182.2f * 8.0f);
+        int16_t *restrict a2 = w->xs;
+        for (int m = 0; m < OUT_CW; m++)
+            a2[m] = (int16_t)((xa[GRID_PRE + 2 * m] + xa[GRID_PRE + 2 * m + 1]) >> 1);
+        int16_t *restrict b2 = w->xs + OUT_CW;
+        for (int m = 0; m < OUT_CW; m++)
+            b2[m] = (int16_t)((xb[GRID_PRE + 2 * m] + xb[GRID_PRE + 2 * m + 1]) >> 1);
+        const int32_t mid = (128 << 15) + (1 << 14);
+        for (int m = 0; m < OUT_CW; m++) {
+            const int32_t u = ((int32_t)a2[m] * ua + (int32_t)b2[m] * ub + mid) >> 15;
+            const int32_t x = ((int32_t)a2[m] * va + (int32_t)b2[m] * vb + mid) >> 15;
+            CB[m] = (uint8_t)(u < 0 ? 0 : u > 255 ? 255 : u);
+            CR[m] = (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);
+        }
+    } else {
+        memset(CB, 128, OUT_CW);
+        memset(CR, 128, OUT_CW);
+    }
+    jb->fld->q[jb->row] = jb->q;
+}
+
 static void run_line_job(const decoder_t *d, const line_job_t *jb, line_work_t *w)
 {
+    if (d->clean && !jb->hq) {
+        run_line_job_fx(d, jb, w);
+        return;
+    }
     const uint8_t *raw = jb->raw;
     const int nseg = jb->nseg;
     if (jb->hq) {
@@ -679,19 +922,6 @@ static void run_line_job(const decoder_t *d, const line_job_t *jb, line_work_t *
             const float *h = d->rs[p];
             float acc = 0;
             for (int k = 0; k < RS_TAPS; k++)
-                acc += h[k] * src[k];
-            w->v[j] = acc;
-        }
-    } else if (d->clean) {
-        for (int k = 0; k < nseg; k++)
-            w->fl[k] = ((float)raw[k + 1] - jb->bl) * jb->gain;
-        for (int j = 0; j < GRID_N; j++) {
-            const float x = jb->x0 + (float)j * jb->dx;
-            const int i0 = (int)x;
-            const float *src = w->fl + i0 - (SR_TAPS / 2 - 1);
-            const float *h = d->sr[(int)((x - (float)i0) * RS_PH + 0.5f)];
-            float acc = 0;
-            for (int k = 0; k < SR_TAPS; k++)
                 acc += h[k] * src[k];
             w->v[j] = acc;
         }
@@ -789,6 +1019,7 @@ static void *line_worker(void *arg)
     line_work_t w;
     memset(&w, 0, sizeof(w));
     w.fl = malloc(sizeof(float) * (size_t)d->fl_cap);
+    thread_begin("lines");
     for (;;) {
         pthread_mutex_lock(&d->q_mu);
         while (d->q_next == d->q_ready && !d->q_stop)
@@ -797,16 +1028,24 @@ static void *line_worker(void *arg)
             pthread_mutex_unlock(&d->q_mu);
             break;
         }
-        const unsigned slot = d->q_next++ % JOBQ;
+        const unsigned first = d->q_next;
+        unsigned n = d->q_ready - first;
+        if (n > JOB_BATCH)
+            n = JOB_BATCH;
+        d->q_next += n;
         pthread_mutex_unlock(&d->q_mu);
-        run_line_job(d, &d->jobs[slot], &w);
+        for (unsigned k = 0; k < n; k++)
+            run_line_job(d, &d->jobs[(first + k) % JOBQ], &w);
         pthread_mutex_lock(&d->q_mu);
-        d->job_state[slot] = 0;
-        d->pending--;
-        pthread_cond_broadcast(&d->q_done);
+        for (unsigned k = 0; k < n; k++)
+            d->job_state[(first + k) % JOBQ] = 0;
+        d->pending -= (int)n;
+        if (d->q_waiting)
+            pthread_cond_broadcast(&d->q_done);
         pthread_mutex_unlock(&d->q_mu);
     }
     free(w.fl);
+    thread_end("lines");
     return NULL;
 }
 
@@ -816,8 +1055,14 @@ static void wait_lines(decoder_t *d)
     if (!d->nworkers)
         return;
     pthread_mutex_lock(&d->q_mu);
+    if (d->q_ready != d->q_tail) {      /* hand out the incomplete batch */
+        d->q_ready = d->q_tail;
+        pthread_cond_broadcast(&d->q_job);
+    }
+    d->q_waiting = true;
     while (d->pending)
         pthread_cond_wait(&d->q_done, &d->q_mu);
+    d->q_waiting = false;
     pthread_mutex_unlock(&d->q_mu);
 }
 
@@ -964,10 +1209,12 @@ static void decode_active(decoder_t *d, double x0, double spu, int row, float q)
         run_line_job(d, &jb, &d->main_work);
         return;
     }
-    pthread_mutex_lock(&d->q_mu);
     const unsigned slot = d->q_tail % JOBQ;
+    pthread_mutex_lock(&d->q_mu);
+    d->q_waiting = true;
     while (d->job_state[slot])
         pthread_cond_wait(&d->q_done, &d->q_mu);
+    d->q_waiting = false;
     d->job_state[slot] = 1;
     pthread_mutex_unlock(&d->q_mu);
     jb.raw = d->job_raw + (size_t)slot * d->raw_cap;
@@ -975,9 +1222,11 @@ static void decode_active(decoder_t *d, double x0, double spu, int row, float q)
     d->jobs[slot] = jb;
     pthread_mutex_lock(&d->q_mu);
     d->q_tail++;
-    d->q_ready = d->q_tail;
     d->pending++;
-    pthread_cond_signal(&d->q_job);
+    if (d->q_tail - d->q_ready >= JOB_BATCH) {
+        d->q_ready = d->q_tail;
+        pthread_cond_signal(&d->q_job);
+    }
     pthread_mutex_unlock(&d->q_mu);
 }
 
@@ -1315,8 +1564,10 @@ decoder_t *decoder_new(const decoder_cfg_t *cfg, int rx_id, field_sink_t sink)
             d->sr[p][k] = (float)h;
             acc += h;
         }
-        for (int k = 0; k < SR_TAPS; k++)
+        for (int k = 0; k < SR_TAPS; k++) {
             d->sr[p][k] = (float)(d->sr[p][k] / acc);
+            d->srq[p][k] = (int16_t)lrintf(d->sr[p][k] * 16384.0f);
+        }
     }
     atomic_store(&d->st.snr_db, 0.0f);
     int nw = cfg->workers < 0 ? 0 : cfg->workers > MAX_WORKERS ? MAX_WORKERS : cfg->workers;
@@ -1346,6 +1597,7 @@ void decoder_free(decoder_t *d)
     free(d->jobs);
     free(d->job_raw);
     free(d->lane);
+    free(d->bx);
     free(d);
 }
 
@@ -1444,7 +1696,10 @@ static void feed(decoder_t *d, const uint16_t *s, const uint8_t *s8, uint32_t n,
     }
     d->len += n;
 
-    slice(d);
+    if (d->nb == 12)
+        slice4(d);
+    else
+        slice(d);
     engine(d);
 
     if (keep_from(d) - d->base > d->cap / 2)
@@ -1474,6 +1729,8 @@ void decoder_get_timing(const decoder_t *d, decoder_timing_t *t)
     t->amp = fmaxf(d->blank - d->tip, 1.0f);
     t->snr_db = atomic_load(&d->st.snr_db);
 }
+
+void decoder_set_skip(decoder_t *d, bool skip) { d->skip_fields = skip; }
 
 int decoder_take_lines(decoder_t *d, decoder_line_t out[DECODER_LINES])
 {

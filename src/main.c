@@ -15,6 +15,7 @@
 #include "decoder.h"
 #include "diversity.h"
 #include "frame.h"
+#include "jumpers.h"
 #include "outputs.h"
 #include "pipeline.h"
 #include "probe.h"
@@ -38,6 +39,7 @@ typedef struct {
     div_mode_t mode;
     double t_last;
     uint64_t f_last;
+    uint64_t skip_last;
     float fps;
 } app_t;
 
@@ -102,6 +104,58 @@ static size_t status_json(void *ctx, char *buf, size_t n)
     return o < n ? o : 0;
 }
 
+/* ------------------------------------------------------------ outputs */
+
+typedef enum { VID_NONE, VID_HDMI, VID_AV } vid_out_t;
+
+typedef struct {
+    frame_pub_t *pub;
+    drm_cfg_t dc;
+    http_cfg_t hc;
+    vid_out_t vid;
+    out_drm_t *drm;
+    out_http_t *http;
+} outputs_t;
+
+/* Start/stop outputs to match; safe to call while running. */
+static void set_outputs(outputs_t *o, vid_out_t vid, bool web)
+{
+    if (vid != o->vid) {
+#ifdef HAVE_DRM
+        out_drm_stop(o->drm);
+        o->drm = NULL;
+        if (vid != VID_NONE) {
+            o->dc.av = vid == VID_AV;
+            o->drm = out_drm_start(&o->dc, o->pub);
+        }
+#else
+        if (vid != VID_NONE)
+            LOGW("built without libdrm: hdmi/av output unavailable");
+#endif
+        o->vid = vid;
+    }
+#ifdef HAVE_JPEG
+    if (web && !o->http)
+        o->http = out_http_start(&o->hc, o->pub);
+    if (!web && o->http) {
+        out_http_stop(o->http);
+        o->http = NULL;
+    }
+#else
+    if (web)
+        LOGW("built without libjpeg: web output unavailable");
+#endif
+}
+
+static void poll_jumpers(outputs_t *o, const jumper_io_t *io, const char *sim, jumper_filter_t *f, bool web_always)
+{
+    jumpers_t j;
+    if (jumper_read(io, sim, &j) || !jumper_filter(f, j, now_s()))
+        return;
+    LOGI("jumpers: %s, web viewer %s", j.av ? "AV" : "HDMI", j.wifi || web_always ? "on" : "off");
+    set_outputs(o, j.av ? VID_AV : VID_HDMI, j.wifi || web_always);
+}
+
 static void print_status(app_t *a)
 {
     decoder_t *fused = pipeline_fused(a->pl);
@@ -118,6 +172,13 @@ static void print_status(app_t *a)
     }
     if (fused && atomic_load(&decoder_stats(fused)->locked))
         o += snprintf(line + o, sizeof(line) - (size_t)o, "fused %4.1fdB | ", atomic_load(&decoder_stats(fused)->snr_db));
+    uint64_t skip = fused ? atomic_load(&decoder_stats(fused)->fields_skipped) : 0;
+    for (int r = 0; !fused && r < a->nrx; r++)
+        skip += atomic_load(&decoder_stats(pipeline_rx(a->pl, r))->fields_skipped);
+    if (skip != a->skip_last)
+        o += snprintf(line + o, sizeof(line) - (size_t)o, "CPU overload, %llu fields skipped | ",
+                      (unsigned long long)(skip - a->skip_last));
+    a->skip_last = skip;
     snprintf(line + o, sizeof(line) - (size_t)o, "%.1f fps", a->fps);
     LOGI("%s", line);
 }
@@ -141,10 +202,14 @@ static void usage(void)
 "      --fast              synth/file: run as fast as possible, never drop\n"
 "\n"
 "output\n"
-"  -o, --output LIST       comma list of hdmi, web, y4m:PATH, none          (default hdmi,web)\n"
+"  -o, --output LIST       comma list of hdmi, av, web, jumpers, y4m:PATH, none  (default hdmi,web)\n"
+"                          av: composite video (instead of hdmi; they cannot run together)\n"
+"                          jumpers: GPIO4-GND fitted = av, open = hdmi; GPIO5-GND fitted = web\n"
+"      --av-std S          auto (same as the camera) | pal | ntsc            (default auto)\n"
+"      --av-progressive    288p/240p instead of 576i/480i\n"
 "      --hdmi-mode M       auto | WxH@HZ                                     (default auto)\n"
 "      --stretch           fill the screen (default keeps 4:3)\n"
-"      --web-port N        (default 8080)   --web-fps N (25)   --jpeg-quality N (70)\n"
+"      --web-port N        (default 80 and 8080)   --web-fps N (30)   --jpeg-quality N (70)\n"
 "      --deint bob|weave   (default bob: 50/60 fps, lowest latency)\n"
 "      --no-osd            hide the receiver signal bars\n"
 "\n"
@@ -201,9 +266,12 @@ int main(int argc, char **argv)
 
     const char *src_spec = "smi", *outputs = "hdmi,web", *rec_path = NULL, *hdmi_mode = "auto";
     bool rx_b = true, fast = false, osd = true, stretch = false;
-    int web_port = 8080, web_fps = 25, jpeg_q = 70;
+    int web_port = 0, web_fps = 30, jpeg_q = 70;
     deint_t deint = DEINT_BOB;
     bool div_given = false;
+    video_std_t av_std = STD_UNKNOWN;
+    bool av_prog = false;
+    const char *jumper_sim = NULL;
     source_cfg_t scfg;
     source_cfg_default(&scfg);
     decoder_cfg_t dcfg;
@@ -216,7 +284,7 @@ int main(int argc, char **argv)
     enum {
         O_RX = 256, O_FS, O_SMI_TIMING, O_SMI_SWAP, O_BLOCK, O_SECONDS, O_FAST, O_HDMI_MODE, O_STRETCH,
         O_WEB_PORT, O_WEB_FPS, O_JPEG_Q, O_DEINT, O_NO_OSD, O_STD, O_DIV, O_HYST, O_BLEND_DB, O_MONO, O_SAT,
-        O_DMA_CHAN, O_DMA_FORCE, O_WORKERS, O_CONTRAST, O_BRIGHT, O_HSHIFT, O_VOFF, O_NO_MEDIAN, O_HQ, O_NO_CAVG, O_SN, O_SC, O_SF, O_SG, O_SFV, O_SDL, O_RECLK, O_SPPM,
+        O_DMA_CHAN, O_DMA_FORCE, O_WORKERS, O_CONTRAST, O_BRIGHT, O_HSHIFT, O_VOFF, O_NO_MEDIAN, O_HQ, O_NO_CAVG, O_SN, O_SC, O_SF, O_SG, O_SFV, O_SDL, O_RECLK, O_SPPM, O_AVSTD, O_AVPROG, O_JSIM,
     };
     static const struct option opts[] = {
         {"source", required_argument, 0, 's'}, {"output", required_argument, 0, 'o'},
@@ -235,7 +303,8 @@ int main(int argc, char **argv)
         {"hshift", required_argument, 0, O_HSHIFT}, {"voffset", required_argument, 0, O_VOFF},
         {"median", no_argument, 0, O_NO_MEDIAN}, {"hq", no_argument, 0, O_HQ}, {"no-chroma-avg", no_argument, 0, O_NO_CAVG},
         {"synth-noise", required_argument, 0, O_SN}, {"synth-clicks", required_argument, 0, O_SC},
-        {"synth-fade", required_argument, 0, O_SF}, {"synth-gaps", required_argument, 0, O_SG}, {"synth-fakevs", required_argument, 0, O_SFV}, {"synth-delay", required_argument, 0, O_SDL}, {"no-reclock", no_argument, 0, O_RECLK}, {"synth-ppm", required_argument, 0, O_SPPM},
+        {"synth-fade", required_argument, 0, O_SF}, {"synth-gaps", required_argument, 0, O_SG}, {"synth-fakevs", required_argument, 0, O_SFV}, {"synth-delay", required_argument, 0, O_SDL}, {"av-std", required_argument, 0, O_AVSTD}, {"av-progressive", no_argument, 0, O_AVPROG}, {"jumper-sim", required_argument, 0, O_JSIM},
+        {"no-reclock", no_argument, 0, O_RECLK}, {"synth-ppm", required_argument, 0, O_SPPM},
         {0, 0, 0, 0},
     };
     int c;
@@ -296,6 +365,11 @@ int main(int argc, char **argv)
         case O_SF: scfg.synth_fade_period = atof(optarg); break;
         case O_SG: scfg.synth_gap_every = atof(optarg); break;
         case O_SFV: scfg.synth_fakevs = atof(optarg); break;
+        case O_AVSTD:
+            av_std = !strcmp(optarg, "pal") ? STD_PAL : !strcmp(optarg, "ntsc") ? STD_NTSC : STD_UNKNOWN;
+            break;
+        case O_AVPROG: av_prog = true; break;
+        case O_JSIM: jumper_sim = optarg; break;    /* testing: file instead of GPIOs */
         case O_RECLK: dcfg.reclock = false; break;
         case O_SPPM: {
             double pa = 0, pb = 0;
@@ -370,34 +444,44 @@ int main(int argc, char **argv)
                  .t_last = now_s()};
 
     out_y4m_t *y4m = NULL;
-    out_drm_t *drm = NULL;
-    out_http_t *http = NULL;
+    outputs_t out = {.pub = &pub};
+    out.dc = (drm_cfg_t){.mode = hdmi_mode, .stretch = stretch, .av_std = av_std, .av_progressive = av_prog};
+#ifdef HAVE_JPEG
+    out.hc = (http_cfg_t){.port = web_port, .fps = web_fps, .quality = jpeg_q, .status = status_json, .status_ctx = &app};
+#endif
+    bool want_hdmi = false, want_av = false, want_web = false, use_jumpers = false;
     char *olist = strdup(outputs);
     for (char *tok = strtok(olist, ","); tok; tok = strtok(NULL, ",")) {
-        if (!strcmp(tok, "hdmi")) {
-#ifdef HAVE_DRM
-            drm_cfg_t dc = {.mode = hdmi_mode, .stretch = stretch};
-            drm = out_drm_start(&dc, &pub);
-#else
-            LOGW("built without libdrm: hdmi output unavailable");
-#endif
-        } else if (!strcmp(tok, "web")) {
-#ifdef HAVE_JPEG
-            http_cfg_t hc = {.port = web_port, .fps = web_fps, .quality = jpeg_q, .status = status_json,
-                             .status_ctx = &app};
-            http = out_http_start(&hc, &pub);
-#else
-            LOGW("built without libjpeg: web output unavailable");
-#endif
-        } else if (!strncmp(tok, "y4m:", 4)) {
+        if (!strcmp(tok, "hdmi"))
+            want_hdmi = true;
+        else if (!strcmp(tok, "av"))
+            want_av = true;
+        else if (!strcmp(tok, "web"))
+            want_web = true;
+        else if (!strcmp(tok, "jumpers"))
+            use_jumpers = true;
+        else if (!strncmp(tok, "y4m:", 4))
             y4m = out_y4m_open(tok + 4, &pub);
-        } else if (strcmp(tok, "none") != 0) {
+        else if (strcmp(tok, "none") != 0)
             LOGW("unknown output '%s'", tok);
-        }
     }
     free(olist);
-    (void)hdmi_mode;
-    (void)stretch;
+    if (want_hdmi && want_av) {
+        LOGW("hdmi and av cannot run together: using av");
+        want_hdmi = false;
+    }
+    jumper_io_t jio = {.fd = -1};
+    jumper_filter_t jf = {0};
+    if (use_jumpers && !jumper_sim && jumper_open(&jio)) {
+        LOGW("jumpers not readable: using hdmi and web");
+        use_jumpers = false;
+        want_hdmi = !want_av;
+        want_web = true;
+    }
+    if (use_jumpers)
+        poll_jumpers(&out, &jio, jumper_sim, &jf, want_web);
+    else
+        set_outputs(&out, want_av ? VID_AV : want_hdmi ? VID_HDMI : VID_NONE, want_web);
 
     if (pipeline_start(pl) || source_start(src, &ring)) {
         LOGE("cannot start capture");
@@ -410,6 +494,8 @@ int main(int argc, char **argv)
     while (!frame_pub_is_eof(&pub)) {
         usleep(100000);
         update_fps(&app);
+        if (use_jumpers)
+            poll_jumpers(&out, &jio, jumper_sim, &jf, want_web);
         if (now_s() >= next_print) {
             next_print += 2.0;
             print_status(&app);
@@ -423,14 +509,8 @@ int main(int argc, char **argv)
     ring_set_eof(&ring);
     pipeline_join(pl);
     frame_pub_set_eof(&pub);
-#ifdef HAVE_DRM
-    out_drm_stop(drm);
-#endif
-#ifdef HAVE_JPEG
-    out_http_stop(http);
-#endif
-    (void)drm;
-    (void)http;
+    set_outputs(&out, VID_NONE, false);
+    jumper_close(&jio);
     out_y4m_close(y4m);
 
     div_stats_t *ds = diversity_stats(app.dv);
@@ -449,6 +529,7 @@ int main(int argc, char **argv)
     if (pipeline_fusion(pl)) {
         fusion_stats_t *fs = fusion_stats(pipeline_fusion(pl));
         decoder_stats_t *st = decoder_stats(pipeline_fused(pl));
+        LOGD("fused: skipped fields %llu", (unsigned long long)atomic_load(&st->fields_skipped));
         LOGD("fused: fields %llu, vsyncs %llu (rejected %llu, flywheel %llu), lock losses %llu, snr %.1f dB, "
              "B delay %.3f us, outliers A %llu B %llu, realigns %llu",
              (unsigned long long)atomic_load(&st->fields), (unsigned long long)atomic_load(&st->vsyncs),

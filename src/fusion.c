@@ -6,15 +6,18 @@
 #include <string.h>
 
 #include "common.h"
+#include "vec16.h"
 
 #define FS_CODE 20e6
 #define QDEPTH 6            /* blocks queued per receiver */
+#define OQDEPTH 4           /* fused blocks queued for the decoder */
 #define HIST_LINES 400      /* history kept: a field plus the line-offset search span */
 #define H_MAX 1290          /* codes per line, upper bound */
 #define HOLD_LINES 4        /* output lags this much so line weights see both sides */
+#define LINES_KEPT 110      /* per-line noise history: alignment range plus two blocks */
 #define SMOOTH 3            /* line noise averaged over +-SMOOTH lines */
 #define NV_UNLOCKED 4.0f    /* noise power of a receiver without lock (sync depth^2) */
-#define CHUNK 128           /* samples per constant-weight, constant-phase step */
+#define CHUNK 256           /* samples per constant-weight, constant-phase step */
 #define BTAPS 8
 #define BPH 64
 #define OUTLIER 4.5f        /* sigmas */
@@ -28,7 +31,7 @@ typedef struct {
     uint8_t *codes;
     uint32_t n, cap;
     uint64_t k0, cap_start;
-    bool discont;
+    bool discont, late;
     reclock_state_t st;
     decoder_timing_t tm;
     decoder_line_t ll[DECODER_LINES];
@@ -45,7 +48,7 @@ typedef struct {
     uint64_t base;
     reclock_state_t st;
     decoder_timing_t tm;
-    decoder_line_t ln[2 * DECODER_LINES];
+    decoder_line_t ln[LINES_KEPT + DECODER_LINES];
     int nln;
 } lane_t;
 
@@ -69,8 +72,15 @@ struct fusion {
     size_t va_cap;
     float bt[BPH + 1][BTAPS];
     int16_t a16[CHUNK], b16[CHUNK];
-    uint8_t *out;
-    size_t out_cap;
+    /* fused blocks for the decoder thread */
+    struct {
+        uint8_t *buf;
+        size_t n, cap;
+        uint64_t start;
+        bool discont, skip;
+    } oq[OQDEPTH];
+    unsigned ohead, otail;
+    bool oeof, skip;
     fusion_stats_t st;
 };
 
@@ -121,14 +131,15 @@ void fusion_free(fusion_t *f)
     pthread_mutex_destroy(&f->mu);
     pthread_cond_destroy(&f->cv);
     free(f->va);
-    free(f->out);
+    for (int k = 0; k < OQDEPTH; k++)
+        free(f->oq[k].buf);
     free(f);
 }
 
 fusion_stats_t *fusion_stats(fusion_t *f) { return &f->st; }
 
 void fusion_push(fusion_t *f, int lane, decoder_t *dec, const uint8_t *codes, uint32_t n, uint64_t k0,
-                 const reclock_state_t *st, uint64_t cap_start, bool discont)
+                 const reclock_state_t *st, uint64_t cap_start, bool discont, bool late)
 {
     lane_t *l = &f->l[lane];
     pthread_mutex_lock(&f->mu);
@@ -149,6 +160,7 @@ void fusion_push(fusion_t *f, int lane, decoder_t *dec, const uint8_t *codes, ui
     b->k0 = k0;
     b->cap_start = cap_start;
     b->discont = discont;
+    b->late = late;
     b->st = *st;
     decoder_get_timing(dec, &b->tm);
     b->nll = decoder_take_lines(dec, b->ll);
@@ -183,16 +195,16 @@ static double b2a(const fusion_t *f, double k)
 
 /* Whole-line part of B's delay: correlate A's vertical interval (equalising,
  * broad and normal sync lines differ line by line, whatever the picture
- * shows) with B shifted by dl + k*H for every k. Returns false if the window
- * is not (yet) inside the history or the peak is not clear. */
-static bool resolve_lines(fusion_t *f, double dl, int *k_out)
+ * shows) with B shifted by dl + k*H for every k. Returns 1 when found, 0 if the
+ * peak is not clear, -1 if the window is not (yet) inside the history. */
+static int resolve_lines(fusion_t *f, double dl, int *k_out)
 {
     const lane_t *A = &f->l[0], *B = &f->l[1];
     const double H = A->tm.H, W = CORR_LINES * H;
     const double a0 = A->tm.last_vs - CORR_PRE * H, b00 = a2b(f, a0) + dl;
     if (a0 < (double)A->base || a0 + W + 2 >= (double)(A->base + A->len) || b00 - CORR_K * H < (double)B->base ||
         b00 + CORR_K * H + W + 2 >= (double)(B->base + B->len))
-        return false;
+        return -1;
     const int n = (int)(W / CORR_STEP);
     if (f->va_cap < (size_t)n) {
         f->va_cap = (size_t)n;
@@ -209,7 +221,7 @@ static bool resolve_lines(fusion_t *f, double dl, int *k_out)
         sa += va[j] * va[j];
     }
     if (sa < 1.0f)
-        return false;
+        return 0;
     float best = -2, second = -2;
     int kbest = 0;
     for (int k = -CORR_K; k <= CORR_K; k++) {
@@ -233,9 +245,9 @@ static bool resolve_lines(fusion_t *f, double dl, int *k_out)
     }
     LOGT("fusion: vertical interval correlation %.3f at %d lines, next %.3f", best, kbest, second);
     if (best < 0.3f || best - second < 0.05f)
-        return false;
+        return 0;
     *k_out = kbest;
-    return true;
+    return 1;
 }
 
 static void unalign(fusion_t *f, const char *why)
@@ -293,7 +305,10 @@ static void update_alignment(fusion_t *f)
     }
     const uint64_t now = f->l[0].base + f->l[0].len;
     int k;
-    if (ta->vlock && (!f->have_delta || now >= f->next_check) && resolve_lines(f, dl, &k)) {
+    const int found = ta->vlock && now >= f->next_check ? resolve_lines(f, dl, &k) : -1;
+    if (found == 0)
+        f->next_check = now + (uint64_t)(0.01 * FS_CODE);   /* the search is expensive: not on every block */
+    if (found > 0) {
         const double cand = dl + k * H;
         f->next_check = now + (uint64_t)(0.5 * FS_CODE);
         if (!f->have_delta) {
@@ -318,8 +333,8 @@ static void update_alignment(fusion_t *f)
 /* --------------------------------------------------------------- weights */
 
 typedef struct {
-    double pos[2 * DECODER_LINES];  /* A timeline */
-    float nv[2 * DECODER_LINES];
+    double pos[LINES_KEPT + DECODER_LINES];  /* A timeline */
+    float nv[LINES_KEPT + DECODER_LINES];
     int n, i;
     double H;
     bool locked;
@@ -373,40 +388,61 @@ static float noise_at(noise_t *z, double k)
 
 /* ------------------------------------------------------------- combining */
 
-/* A and B in 1/32 fused codes. Plain loops on int16: they vectorise. */
-static void scale_a(int16_t *restrict o, const uint8_t *restrict x, int n, int slope, int off)
+/* A and B in 1/32 fused codes, all int16: these loops vectorise. */
+static void scale_a(int16_t *restrict o, const uint8_t *restrict x, int slope, int off)
 {
-    for (int i = 0; i < n; i++)
-        o[i] = (int16_t)((int16_t)x[i] * (int16_t)slope + (int16_t)off);
+    const v8s k = v8_dup(slope), f = v8_dup(off);
+    for (int i = 0; i < CHUNK; i += 8)
+        v8_store(o + i, v8_load_u8(x + i) * k + f);
 }
 
-static void interp_b(int16_t *restrict o, const uint8_t *restrict x, int n, const int16_t h[BTAPS], int off)
+/* Taps carry the lane's gain. Products of 6-bit codes fit int16, and wrapped
+ * partial sums are harmless: the final value fits. */
+static void interp_b(int16_t *restrict o, const uint8_t *restrict x, const int16_t h[BTAPS], int off)
 {
-    for (int i = 0; i < n; i++) {
-        int32_t acc = 0;
+    const v8s f = v8_dup(off);
+#ifdef __ARM_NEON
+    const int16x8_t t = vld1q_s16(h);
+    int16x8_t a = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(x)));
+    for (int i = 0; i < CHUNK; i += 8) {
+        const int16x8_t b = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(x + i + 8)));
+        int16x8_t s = vmlaq_laneq_s16((int16x8_t)f, a, t, 0);
+        s = vmlaq_laneq_s16(s, vextq_s16(a, b, 1), t, 1);
+        s = vmlaq_laneq_s16(s, vextq_s16(a, b, 2), t, 2);
+        s = vmlaq_laneq_s16(s, vextq_s16(a, b, 3), t, 3);
+        s = vmlaq_laneq_s16(s, vextq_s16(a, b, 4), t, 4);
+        s = vmlaq_laneq_s16(s, vextq_s16(a, b, 5), t, 5);
+        s = vmlaq_laneq_s16(s, vextq_s16(a, b, 6), t, 6);
+        s = vmlaq_laneq_s16(s, vextq_s16(a, b, 7), t, 7);
+        vst1q_s16(o + i, s);
+        a = b;
+    }
+#else
+    for (int i = 0; i < CHUNK; i += 8) {
+        v8s s = f;
         for (int k = 0; k < BTAPS; k++)
-            acc += (int32_t)h[k] * (int16_t)x[i + k];
-        o[i] = (int16_t)(((acc + 32) >> 6) + off);
+            s += v8_load_u8(x + i + k) * v8_dup(h[k]);
+        v8_store(o + i, s);
     }
+#endif
 }
 
-/* u = b + w (a - b), w in 1/4096; returns how many |a-b| exceed thr and adds
- * up the rest. */
-static int mix(uint8_t *restrict out, const int16_t *restrict a, const int16_t *restrict b, int n, int w, int thr,
-               int32_t *sum)
+/* u = b + w (a - b), w in Q15; returns how many |a-b| exceed thr and the sum of
+ * the others. */
+static int mix(uint8_t *restrict out, const int16_t *restrict a, const int16_t *restrict b, int w, int thr, int32_t *sum)
 {
-    int32_t cnt = 0, s = 0;
-    for (int i = 0; i < n; i++) {
-        const int32_t d = (int32_t)a[i] - b[i];
-        const int32_t ad = d < 0 ? -d : d;
-        const int32_t big = ad > thr;
-        cnt += big;
-        s += big ? 0 : ad;
-        const int32_t u = (b[i] + ((d * w + 2048) >> 12) + 16) >> 5;
-        out[i] = (uint8_t)(u < 0 ? 0 : u > 255 ? 255 : u);
+    const v8s wq = v8_dup(w), th = v8_dup(thr), r = v8_dup(16);
+    v8s cnt = v8_dup(0);
+    int32_t s = 0;
+    for (int i = 0; i < CHUNK; i += 8) {
+        const v8s vb = v8_load(b + i), d = v8_load(a + i) - vb, ad = v8_abs(d);
+        cnt -= (v8s)(ad > th);
+        s += v8_sum(v8_min(ad, th) >> 3);
+        v8_store_u8(out + i, (vb + v8_mulr(d, wq) + r) >> 5);
     }
-    *sum = s;
-    return cnt;
+    const int n = v8_sum(cnt);
+    *sum = 8 * s - n * thr;
+    return n;
 }
 
 static inline uint8_t clip_code(int v)
@@ -435,17 +471,23 @@ static void emit(fusion_t *f)
     if (lim < (double)f->out_next + CHUNK)
         return;
     const size_t cnt = (size_t)(lim - (double)f->out_next) / CHUNK * CHUNK;
-    if (f->out_cap < cnt) {
-        f->out_cap = cnt;
-        f->out = realloc(f->out, cnt);
+    pthread_mutex_lock(&f->mu);
+    while (f->otail - f->ohead >= OQDEPTH)
+        pthread_cond_wait(&f->cv, &f->mu);
+    pthread_mutex_unlock(&f->mu);
+    const unsigned os = f->otail % OQDEPTH;
+    if (f->oq[os].cap < cnt) {
+        f->oq[os].cap = cnt + 8192;
+        f->oq[os].buf = realloc(f->oq[os].buf, f->oq[os].cap);
     }
+    uint8_t *const out = f->oq[os].buf;
 
     noise_t zn[2];
     noise_prepare(f, 0, &zn[0]);
     noise_prepare(f, 1, &zn[1]);
     const float sa = lane_slope(A), sb = lane_slope(B);
-    const int slopeA = (int)lrintf(sa), offA = (int)lrintf(FUSED_BLANK * 32.0f - A->tm.blank * sa);
-    const int offB = (int)lrintf(FUSED_BLANK * 32.0f - B->tm.blank * sb);
+    const int slopeA = (int)lrintf(sa), offA = (int)lrintf(FUSED_BLANK * 32.0f - A->tm.blank * (float)slopeA);
+    const int offB = (int)lrintf(FUSED_BLANK * 32.0f - B->tm.blank * lrintf(sb));
     const double scale = a2b(f, (double)f->out_next + 1e6) - a2b(f, (double)f->out_next);
     const double b0 = a2b(f, (double)f->out_next) + d;
     float share = 0;
@@ -456,7 +498,7 @@ static void emit(fusion_t *f)
 
     for (size_t c = 0; c < cnt; c += CHUNK) {
         const uint64_t ka = f->out_next + c;
-        uint8_t *o = f->out + c;
+        uint8_t *o = out + c;
         const uint8_t *pa = A->x + (ka - A->base);
         /* B position, constant fraction over the chunk (ppm differences) */
         const double kb = b0 + ((double)c + 0.5 * CHUNK) * scale * 1e-6 - 0.5 * CHUNK;
@@ -465,13 +507,21 @@ static void emit(fusion_t *f)
         const bool haveB = ib >= 0 && (size_t)ib + CHUNK + BTAPS <= B->len;
 
         if (useA)
-            scale_a(f->a16, pa, CHUNK, slopeA, offA);
+            scale_a(f->a16, pa, slopeA, offA);
         if (useB && haveB) {
             const float *h = f->bt[(int)((kb - fl) * BPH + 0.5)];
             int16_t hq[BTAPS];
             for (int k = 0; k < BTAPS; k++)
-                hq[k] = (int16_t)lrintf(h[k] * sb * 64.0f);
-            interp_b(f->b16, B->x + ib, CHUNK, hq, offB);
+                hq[k] = (int16_t)lrintf(h[k] * sb);
+            /* rounding must not change the gain: put the rest on the main tap */
+            int rest = (int)lrintf(sb), big = 0;
+            for (int k = 0; k < BTAPS; k++) {
+                rest -= hq[k];
+                if (hq[k] > hq[big])
+                    big = k;
+            }
+            hq[big] = (int16_t)(hq[big] + rest);
+            interp_b(f->b16, B->x + ib, hq, offB);
         }
         if (!both || !haveB) {
             const int16_t *src = useA ? f->a16 : haveB ? f->b16 : NULL;
@@ -487,7 +537,7 @@ static void emit(fusion_t *f)
         const float sig = sqrtf(f->noise_cal * (na + nb)) * FUSED_SYNC * 32.0f;
         const int thr = (int)fminf(fmaxf(OUTLIER * sig, 0.35f * FUSED_SYNC * 32.0f), 30000.0f);
         int32_t s;
-        int big = mix(o, f->a16, f->b16, CHUNK, (int)lrintf(w * 4096.0f), thr, &s);
+        int big = mix(o, f->a16, f->b16, (int)lrintf(w * 32767.0f), thr, &s);
         if (sig < 8.0f * FUSED_SYNC) {          /* calibrate on healthy stretches only */
             sum += s;
             pred += sqrtf(na + nb) * CHUNK;
@@ -525,9 +575,36 @@ static void emit(fusion_t *f)
     atomic_fetch_add(&f->st.outliers[0], rej[0]);
     atomic_fetch_add(&f->st.outliers[1], rej[1]);
 
-    decoder_feed_u8(f->main, f->out, (uint32_t)cnt, f->out_next, f->discont_out);
+    f->oq[os].n = cnt;
+    f->oq[os].start = f->out_next;
+    f->oq[os].discont = f->discont_out;
+    f->oq[os].skip = f->skip;
     f->discont_out = false;
     f->out_next += cnt;
+    pthread_mutex_lock(&f->mu);
+    f->otail++;
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->mu);
+}
+
+bool fusion_decode_step(fusion_t *f)
+{
+    pthread_mutex_lock(&f->mu);
+    while (f->ohead == f->otail && !f->oeof)
+        pthread_cond_wait(&f->cv, &f->mu);
+    if (f->ohead == f->otail) {
+        pthread_mutex_unlock(&f->mu);
+        return false;
+    }
+    pthread_mutex_unlock(&f->mu);
+    const unsigned os = f->ohead % OQDEPTH;
+    decoder_set_skip(f->main, f->oq[os].skip);
+    decoder_feed_u8(f->main, f->oq[os].buf, (uint32_t)f->oq[os].n, f->oq[os].start, f->oq[os].discont);
+    pthread_mutex_lock(&f->mu);
+    f->ohead++;
+    pthread_cond_broadcast(&f->cv);
+    pthread_mutex_unlock(&f->mu);
+    return true;
 }
 
 /* --------------------------------------------------------------- stepping */
@@ -540,16 +617,18 @@ static void lane_append(lane_t *l, const blk_t *b, bool reset)
         l->nln = 0;
     }
     if (l->cap < l->len + b->n) {
-        l->cap = 2 * (l->len + b->n) + (HIST_LINES + 100) * H_MAX;
+        l->cap = l->len + b->n + (HIST_LINES + 1000) * H_MAX;
         l->x = realloc(l->x, l->cap);
     }
     memcpy(l->x + l->len, b->codes, b->n);
     l->len += b->n;
     l->st = b->st;
     l->tm = b->tm;
-    const int max = 2 * DECODER_LINES;
+    const int max = LINES_KEPT;
     if (l->nln + b->nll > max) {
-        const int drop = l->nln + b->nll - max;
+        int drop = l->nln + b->nll - max;
+        if (drop > l->nln)
+            drop = l->nln;
         memmove(l->ln, l->ln + drop, sizeof(l->ln[0]) * (size_t)(l->nln - drop));
         l->nln -= drop;
     }
@@ -566,7 +645,7 @@ static void lane_trim(lane_t *l, double need)
     if (lo <= (double)l->base)
         return;
     size_t drop = (size_t)(lo - (double)l->base);
-    if (drop < 200 * H_MAX)
+    if (drop < 900 * H_MAX)     /* move rarely: the buffers are cheap, the copies are not */
         return;
     memmove(l->x, l->x + drop, l->len - drop);
     l->len -= drop;
@@ -581,6 +660,8 @@ bool fusion_step(fusion_t *f)
     for (;;) {
         while (A->head == A->tail || B->head == B->tail) {
             if ((A->head == A->tail && A->eof) || (B->head == B->tail && B->eof)) {
+                f->oeof = true;
+                pthread_cond_broadcast(&f->cv);
                 pthread_mutex_unlock(&f->mu);
                 return false;
             }
@@ -599,6 +680,7 @@ bool fusion_step(fusion_t *f)
     pthread_mutex_unlock(&f->mu);
 
     const bool disc = a->discont || b->discont;
+    f->skip = a->late || b->late;
     lane_append(A, a, disc);
     lane_append(B, b, disc);
     pthread_mutex_lock(&f->mu);

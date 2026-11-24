@@ -32,6 +32,7 @@ add_library(c5core STATIC
   src/reclock.c
   src/pipeline.c
   src/frame.c
+  src/jumpers.c
   src/source.c
   src/source_synth.c
   src/source_file.c
@@ -79,3 +80,12 @@ enable_testing()
 add_executable(test_pipeline test/test_pipeline.c)
 target_link_libraries(test_pipeline PRIVATE c5core)
 add_test(NAME pipeline COMMAND test_pipeline)
+
+if(DRM_FOUND)
+  # out_drm.c against a fake libdrm
+  add_executable(test_outputs test/test_outputs.c src/out_drm.c)
+  target_include_directories(test_outputs PRIVATE ${DRM_INCLUDE_DIRS})
+  target_link_libraries(test_outputs PRIVATE c5core)
+  target_link_options(test_outputs PRIVATE -Wl,--wrap=open)
+  add_test(NAME outputs COMMAND test_outputs)
+endif()

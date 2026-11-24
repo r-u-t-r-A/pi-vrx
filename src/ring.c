@@ -136,3 +136,11 @@ void ring_release(ring_t *r, int id)
         pthread_cond_broadcast(&r->cv_space);
     pthread_mutex_unlock(&r->mu);
 }
+
+uint32_t ring_backlog(ring_t *r, int id)
+{
+    pthread_mutex_lock(&r->mu);
+    const uint64_t n = r->head - r->cons_seq[id];
+    pthread_mutex_unlock(&r->mu);
+    return n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
+}

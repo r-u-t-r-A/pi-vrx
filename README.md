@@ -96,10 +96,10 @@ setting (EXPERIMENTAL → Clock Pin D10 = ON), and probe output.
 ```
 sudo ./pi/install.sh                    # deps, build, SMI overlay, config.txt, service
 sudo reboot
-sudo c5div probe                        # wiring and signal check
-sudo c5div run                          # HDMI + web viewer on :8080
+sudo systemctl stop c5div; sudo c5div probe   # wiring and signal check (then: start c5div)
+sudo systemctl stop c5div; sudo c5div run   # by hand: HDMI + web viewer
 sudo ./pi/setup-ap.sh MYSSID MYPASSWORD # optional: Wi-Fi AP at 192.168.50.1
-sudo systemctl enable --now c5div       # optional: start at boot (/etc/default/c5div)
+# c5div starts at boot; options in /etc/default/c5div
 sudo c5div record --seconds 5 -O cap.raw   # raw capture, replay with -s file:cap.raw
 ```
 
@@ -110,7 +110,13 @@ sudo c5div record --seconds 5 -O cap.raw   # raw capture, replay with -s file:ca
   conversion; otherwise the hardware scaler fits the picture at 4:3
   (`--stretch` to fill). It uses a YUV420 plane, so no CPU colour conversion.
   Run on Raspberry Pi OS **Lite** (no desktop holding the display).
-- **Web** (`-o web`): `/` is a fullscreen viewer with receiver status,
+- **Composite AV** (`-o av`): the Pi's analog TV output, 720 pixels per line
+  passed through 1:1, PAL or NTSC like the camera (`--av-std`,
+  `--av-progressive`). It replaces HDMI while it runs.
+- **Jumpers** (`-o jumpers`, the service default): a jumper on GPIO4 picks AV
+  instead of HDMI and one on GPIO5 turns the web viewer on, also while
+  running. See [docs/WIRING.md](docs/WIRING.md#output-jumpers).
+- **Web** (`-o web`, ports 80 and 8080): `/` is a fullscreen viewer with receiver status,
   `/stream.mjpg` is plain MJPEG (also works in VLC/ffplay),
   `/snapshot.jpg`, and `/status.json`. Encoding only runs while someone
   watches, and slow clients skip frames instead of building latency.
@@ -144,7 +150,9 @@ Not yet verified **on hardware**:
   still available as `-s smidev`, but it loses 20–30 % of the signal between
   reads: the driver copies each buffer out of uncached memory at about
   110 MB/s while SMI is stopped.
-- **HDMI output on vc4:** it compiles, but no display test has been run.
+- **HDMI and AV output on vc4:** tested against a fake libdrm only
+  (`test_outputs`), no display test has been run. Open for AV on a Zero 2W: whether
+  `enable_tvout` is needed, and whether switching works without a reboot.
 - **Live on a Zero 2W (2026-11-23, one C5VRX, NTSC):** 59.9 fields/s with
   `--workers 3` (active lines are decoded on worker threads), about 1.5
   cores. Decoding a recording runs at 1.4× realtime with 3 workers and 1.06×
@@ -160,6 +168,9 @@ Not yet verified **on hardware**:
 3. NEON-tuned slicer and filters if the Zero 2W is short on CPU.
 4. A 2-D comb filter to reduce the remaining cross-colour/cross-luminance.
 5. Hardware H.264 (bcm2835 V4L2 M2M) for lower Wi-Fi bandwidth, plus an RTP/UDP output.
+
+The firmware is a git submodule ([fork of C5VRX](https://github.com/r-u-t-r-A/C5VRX),
+branch `c5div-lite`): `git submodule update --init` fetches it. The Pi does not need it.
 
 Licence: `firmware/` (c5div-rx) is GPL-3.0-only, as C5VRX. The Pi software
 in `src/` is new code that reads the receivers' DAC pins; see the C5VRX credit

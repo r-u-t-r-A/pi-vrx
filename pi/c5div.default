@@ -1,6 +1,8 @@
 # Options for the c5div service (see `c5div --help`).
-# Examples:
+# Output by jumper (docs/WIRING.md): GPIO4-GND fitted = AV, open = HDMI;
+# GPIO5-GND fitted = web viewer. Or fixed:
 #   HDMI only:            --output hdmi
-#   Wi-Fi viewer only:    --output web --web-port 80
+#   composite AV only:    --output av        (--av-std pal|ntsc to force a standard)
+#   Wi-Fi viewer only:    --output web
 #   one receiver:         --rx A
-C5DIV_ARGS="--source smi --output hdmi,web --web-port 80"
+C5DIV_ARGS="--source smi --output jumpers"

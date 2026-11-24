@@ -1,9 +1,11 @@
 [Unit]
 Description=c5div dual C5VRX diversity video receiver
-After=network.target
+# Not after the network: video must not wait for it.
+StartLimitIntervalSec=0
 
 [Service]
 EnvironmentFile=-/etc/default/c5div
+ExecStartPre=/bin/sh -c 'i=0; while [ ! -e /dev/smi ] && [ $i -lt 100 ]; do sleep 0.2; i=$((i+1)); done'
 ExecStart=/usr/local/bin/c5div run $C5DIV_ARGS
 Restart=always
 RestartSec=2

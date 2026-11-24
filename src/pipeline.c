@@ -19,8 +19,11 @@ typedef struct {
     diversity_t *dv;
     int rx;
     bool realtime;
+    double fs;
     pthread_t th;
 } consumer_t;
+
+#define LATE_S 0.022
 
 struct pipeline {
     pipeline_cfg_t cfg;
@@ -31,7 +34,7 @@ struct pipeline {
     fusion_t *fu;
     consumer_t c[2];
     int nc;
-    pthread_t fth;
+    pthread_t fth, dth;
     int started;            /* consumer threads running */
     bool fstarted;
 };
@@ -39,6 +42,8 @@ struct pipeline {
 static void *consumer_thread(void *arg)
 {
     consumer_t *t = arg;
+    const char *name = t->rx ? "rxB" : "rxA";
+    thread_begin(name);
     for (;;) {
         const ring_block_t *b;
         bool ovr;
@@ -52,6 +57,11 @@ static void *consumer_thread(void *arg)
         }
         const bool disc = (b->flags & RING_F_DISCONT) || ovr;
         const uint64_t start = b->start;
+        /* Behind real time by more than 1.3 fields: leave out whole fields (lower
+         * frame rate) instead of running late until the ring overruns. */
+        const bool late = t->realtime && ring_backlog(t->ring, t->cid) * (double)b->n > LATE_S * t->fs;
+        if (!t->fu)
+            decoder_set_skip(t->dec, late);
         if (t->rc) {
             uint32_t m;
             uint64_t k0;
@@ -65,7 +75,7 @@ static void *consumer_thread(void *arg)
             if (m)
                 decoder_feed_u8(t->dec, codes, m, k0, disc);
             if (t->fu)
-                fusion_push(t->fu, t->rx, t->dec, codes, m, k0, &rs, start, disc);
+                fusion_push(t->fu, t->rx, t->dec, codes, m, k0, &rs, start, disc, late);
         } else {
             decoder_feed(t->dec, b->data, b->n, start, disc);
             ring_release(t->ring, t->cid);
@@ -80,16 +90,29 @@ static void *consumer_thread(void *arg)
         decoder_flush(t->dec);
         diversity_rx_eof(t->dv, t->rx);
     }
+    thread_end(name);
     return NULL;
 }
 
 static void *fusion_thread(void *arg)
 {
     pipeline_t *p = arg;
+    thread_begin("fuse");
     while (fusion_step(p->fu))
+        ;
+    thread_end("fuse");
+    return NULL;
+}
+
+static void *decode_thread(void *arg)
+{
+    pipeline_t *p = arg;
+    thread_begin("decode");
+    while (fusion_decode_step(p->fu))
         diversity_poke(p->dv);
     decoder_flush(p->fused);
     diversity_rx_eof(p->dv, 0);
+    thread_end("decode");
     return NULL;
 }
 
@@ -134,7 +157,7 @@ pipeline_t *pipeline_new(const pipeline_cfg_t *cfg, ring_t *ring, frame_pub_t *p
             goto fail;
         consumer_t *t = &p->c[p->nc++];
         *t = (consumer_t){.dec = p->rx[r], .fu = p->fu, .ring = ring, .cid = ring_add_consumer(ring), .dv = p->dv,
-                          .rx = r, .realtime = cfg->realtime};
+                          .rx = r, .realtime = cfg->realtime, .fs = cfg->dec.fs_nom};
         if (rcl && !(t->rc = reclock_new(r)))
             goto fail;
         if (!fuse)
@@ -152,7 +175,7 @@ int pipeline_start(pipeline_t *p)
     if (diversity_start(p->dv))
         return -1;
     if (p->fu) {
-        if (pthread_create(&p->fth, NULL, fusion_thread, p))
+        if (pthread_create(&p->fth, NULL, fusion_thread, p) || pthread_create(&p->dth, NULL, decode_thread, p))
             return -1;
         p->fstarted = true;
     }
@@ -168,8 +191,10 @@ void pipeline_join(pipeline_t *p)
 {
     for (int k = 0; k < p->started; k++)
         pthread_join(p->c[k].th, NULL);
-    if (p->fstarted)
+    if (p->fstarted) {
         pthread_join(p->fth, NULL);
+        pthread_join(p->dth, NULL);
+    }
     if (p->started)
         diversity_join(p->dv);
     p->started = 0;

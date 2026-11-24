@@ -38,7 +38,10 @@ ring -> reclock B -> sync-only decoder B -> fusion_push  > fusion thread -> one 
 | clicks 8/line | 7.3 / 3.2 | 6.4 / 2.9 | 3.8 / 2.0 |
 | 2 ms dips | 21.3 / 17.7 | 5.4 / 6.5 | 5.5 / 3.8 |
 
-CPU on the PC for 1.04 s of real video: one receiver 0.26 s, fuse 0.39-0.45 s, auto 0.60 s. Not measured on the Pi.
+CPU on the Zero 2W for 1.04 s of two-receiver video (2026-11-24, fuse, without capture and JPEG): 4.5 s before, 2.1 s after the
+fixed-point/NEON work; real-time run with web viewer: 59.9 fps, no skipped fields. `-v` prints CPU per thread at the end, `top -H`
+shows the thread names. When behind by more than 22 ms, whole fields are left out (status line: "CPU overload") instead of running
+late until the capture ring overruns (that was the slow-motion/jump effect in the web viewer).
 
 Tests: `test_pipeline` (all), `test_pipeline fuse`, `test_pipeline bench [case]`. ASan/UBSan/TSan clean (run in the ESP-IDF
 container, the host has no sanitizer runtime).
@@ -50,6 +53,9 @@ container, the host has no sanitizer runtime).
    `nohup /usr/local/bin/c5div run --rx A --workers 3 -o web,hdmi > /tmp/c5div.log &`
 2. **Pi, fuse CPU**: `c5div run -s synth:pal ...` is too slow there to be useful as a source; copy a two-lane recording over
    (`-s file:...`) and time it. If too slow: NEON for `reclock_feed` / `interp_b`, fewer BTAPS, SR_TAPS 8 -> 6.
+   Also deploy the AV output and jumpers (docs/WIRING.md): run `pi/config-txt.sh`, reboot, then check: AV picture with the jumper
+   fitted at boot; HDMI<->AV while running; `[gpio4=0]` / `enable_tvout` behaviour on the Zero 2W (docs and forums disagree).
+   The installed /etc/default/c5div is kept by install.sh: set `--output jumpers` there by hand.
 3. **Second XIAO**: header pins 36, 11, 12, 35, 38, 40 (GPIO16-21). Check 16-bit gapless capture (50 MB/s), then live: A-B delay,
    outlier rate, one C5 restarting, one antenna shadowed. Both C5s must be on the same channel.
 4. **Known gaps**: noise clipped at code 0 biases the sync depth (picture gain) at very low SNR, for every mode; both receivers in a
@@ -58,5 +64,4 @@ container, the host has no sanitizer runtime).
 ## Rules to keep
 
 - Do not touch the C5 serial port (`/dev/ttyACM0`) without asking: opening it can reset and hang the C5.
-- `c5div record` and `probe` on the Pi kill a running c5div's capture (shared DMA channel).
-- Pi: `ruter@ruzero.local`.
+- Only one c5div can capture (lock file). Stop the service before `record`/`probe`/a manual run, start it afterwards.

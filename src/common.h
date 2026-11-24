@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -39,3 +40,12 @@ static inline uint8_t u8f(float v)
 #define OUT_CW (OUT_W / 2)
 #define PX_RATE 13.5e6
 #define MAX_FIELD_LINES 288
+
+/* Name the calling thread (top -H), and report its CPU time when it ends (-v). */
+static inline void thread_begin(const char *name) { pthread_setname_np(pthread_self(), name); }
+static inline void thread_end(const char *name)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    LOGD("thread %-8s %6.2f s CPU", name, (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec);
+}
