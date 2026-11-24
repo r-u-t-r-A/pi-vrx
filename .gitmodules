@@ -1,0 +1,4 @@
+[submodule "firmware"]
+	path = firmware
+	url = https://github.com/r-u-t-r-A/C5VRX.git
+	branch = c5div-lite

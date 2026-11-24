@@ -105,7 +105,7 @@ Diversity helps most when the two receivers fade at different times:
 ## Pi setup
 
 ```
-git clone <this repo> && cd <repo>
+git clone https://github.com/r-u-t-r-A/pi-vrx && cd pi-vrx
 sudo ./pi/install.sh           # build, overlay, config.txt, service
 sudo reboot
 ls -l /dev/smi                 # must exist

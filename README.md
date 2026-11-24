@@ -169,6 +169,9 @@ Not yet verified **on hardware**:
 4. A 2-D comb filter to reduce the remaining cross-colour/cross-luminance.
 5. Hardware H.264 (bcm2835 V4L2 M2M) for lower Wi-Fi bandwidth, plus an RTP/UDP output.
 
+The firmware is a git submodule ([fork of C5VRX](https://github.com/r-u-t-r-A/C5VRX),
+branch `c5div-lite`): `git submodule update --init` fetches it. The Pi does not need it.
+
 Licence: `firmware/` (c5div-rx) is GPL-3.0-only, as C5VRX. The Pi software
 in `src/` is new code that reads the receivers' DAC pins; see the C5VRX credit
 above.
