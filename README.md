@@ -119,6 +119,8 @@ sudo c5div record --seconds 5 -O cap.raw   # raw capture, replay with -s file:ca
 - **Jumpers** (`-o jumpers`, the service default): a jumper on GPIO4 picks AV
   instead of HDMI and one on GPIO5 turns the web viewer on, also while
   running. See [docs/WIRING.md](docs/WIRING.md#output-jumpers).
+- **Channel display:** the master receiver tells the other one and the Pi which channel it is
+  on; the web viewer shows it. See [docs/WIRING.md](docs/WIRING.md#channel-link).
 - **Web** (`-o web`, ports 80 and 8080): `/` is a fullscreen viewer with receiver status,
   `/stream.mjpg` is plain MJPEG (also works in VLC/ffplay),
   `/snapshot.jpg`, and `/status.json`. Encoding only runs while someone

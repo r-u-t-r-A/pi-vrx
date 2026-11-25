@@ -16,10 +16,10 @@ cd firmware && tools/build-container.sh
 esptool.py --chip esp32c5 -p /dev/ttyACM0 write_flash 0x0 build/c5div_rx_merged.bin
 ```
 
-Do the same for the second XIAO. Optionally wire **one push button from GND to
-D10 of both XIAOs**: one press moves both receivers to the next channel, and a
-2 s hold puts both back on R1. See `firmware/README.md` for the button actions
-and the one-time calibration (8 s hold).
+Do the same for the second XIAO. Wire a **push button from D10 to GND on one of
+them** (the master) and the [channel link](#channel-link) to the other: a press moves
+both to the next channel, a 2 s hold puts both on R1. See `firmware/README.md` for
+the one-time calibration (8 s hold, on each XIAO).
 
 **Alternative: stock C5VRX** (web flasher on the C5VRX website):
 
@@ -58,6 +58,27 @@ Notes:
 - The resistor DAC is optional. Keep it on one receiver if you also want an
   analog output, e.g. for goggles, at the same time.
 - **One receiver only:** wire receiver A and run with `--rx A` (8-bit SMI).
+
+## Channel link
+
+Both receivers must be on the same channel. The **master** (either one) has the
+channel button and tells the slave and the Pi which channel it is on.
+
+| From | To |
+|---|---|
+| master XIAO **D6** | slave XIAO **D10** |
+| master XIAO **D6** (same wire) | Pi **GPIO15 / RXD, pin 10** |
+| button | master XIAO **D10** to GND |
+| GND | common (already there for the data bus) |
+
+Remove the button wire from the slave's D10 if you had one button on both. Both
+XIAOs run the same firmware (c5div-rx with channel link); the one that hears the other
+becomes the slave. Details: `firmware/README.md`.
+
+The Pi only listens. The web viewer shows `Channel: R3`, or `Channel: --` when nothing
+was heard for 12 s; it is also in `status.json` and the log. `pi/config-txt.sh` (run by
+`install.sh`) sets the UART up: Bluetooth off, so that GPIO15 gets the full UART, and no
+login console on it. Another port: `--channel-uart /dev/ttyUSB0`; off: `--channel-uart none`.
 
 ## Output jumpers
 
