@@ -20,10 +20,13 @@ grep -q '^dtoverlay=vc4-kms-v3d\(,.*\)\?$' "$TMP" || echo 'dtoverlay=vc4-kms-v3d
     echo "# c5div begin"
     echo "[all]"
     [ -f "$TMP.add" ] && cat "$TMP.add"
-    for l in dtoverlay=c5div-smi dtoverlay=smi-dev dtparam=spi=off dtparam=i2s=off; do
+    for l in dtoverlay=c5div-smi dtoverlay=smi-dev dtparam=spi=off dtparam=i2s=off \
+             dtoverlay=disable-bt enable_uart=1; do
         grep -qxF "$l" "$TMP" || echo "$l"
     done
     cat <<'EOT'
+# (disable-bt: the full UART on GPIO14/15 for the channel link, instead of the
+# one that would lock the core clock)
 # output jumpers: GPIO4 (pin 7-9) fitted = AV instead of HDMI,
 # GPIO5 (pin 29-30) fitted = Wi-Fi viewer
 gpio=4,5=ip,pu
@@ -35,4 +38,14 @@ EOT
 } >> "$TMP"
 rm -f "$TMP.add"
 cat "$TMP" > "$CFG"
+
+# The login console on that UART would eat the channel messages.
+CMD=$(dirname "$CFG")/cmdline.txt
+if [ -f "$CMD" ] && grep -qE '(^| )console=(serial0|ttyS0|ttyAMA0)(,[^ ]*)?( |$)' "$CMD"; then
+    [ -f "$CMD.c5div.bak" ] || cp "$CMD" "$CMD.c5div.bak"
+    sed -E 's/(^| )console=(serial0|ttyS0|ttyAMA0)(,[^ ]*)?/\1/g; s/  +/ /g; s/^ //; s/ $//' "$CMD" > "$CMD.new"
+    cat "$CMD.new" > "$CMD"
+    rm -f "$CMD.new"
+    echo "removed the serial console from $CMD (backup: $CMD.c5div.bak)"
+fi
 echo "updated $CFG (first backup: $CFG.c5div.bak)"
