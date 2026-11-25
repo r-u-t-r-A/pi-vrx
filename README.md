@@ -6,6 +6,9 @@ combines both composite streams in software (diversity), decodes the result,
 and outputs the picture on **HDMI** and/or as a **web stream
 over a Wi-Fi access point** that phones and laptops can view.
 
+> **Highly experimental.** It runs on real hardware, but it can be unstable and
+> things change often. See [Status](#status).
+
 ```
  VTX 5.8 GHz
    │                 6-bit DAC bus (digital, tapped before the resistors)
@@ -137,37 +140,41 @@ sudo c5div record --seconds 5 -O cap.raw   # raw capture, replay with -s file:ca
 
 ## Status
 
-The full pipeline has been tested **on a PC** against the synthetic C5 source:
-PAL and NTSC lock, standard detection, colour accuracy (75% bars within 4
-luma / 3 chroma codes), diversity selection and blending, fades, SMI-gap
-recovery, and the web output.
-Not yet verified **on hardware**:
+**It works on real hardware, but it is highly experimental and can be unstable.**
+Expect rough edges, picture glitches and breaking changes. Do not rely on it as
+your only video link.
 
-- **Capture (verified on a Zero 2W, 2026-11-23):** `-s smi` (default) is a
-  gapless capture. SMI read cycles run into a circular DMA chain on DMA
-  channel 7, writing to a firmware-owned 8 MiB ring, and the rate measured
-  24.997 MS/s with zero gaps over 30 s. The kernel `/dev/smi` read path is
-  still available as `-s smidev`, but it loses 20–30 % of the signal between
-  reads: the driver copies each buffer out of uncached memory at about
-  110 MB/s while SMI is stopped.
-- **HDMI and AV output on vc4:** tested against a fake libdrm only
-  (`test_outputs`), no display test has been run. Open for AV on a Zero 2W: whether
-  `enable_tvout` is needed, and whether switching works without a reboot.
-- **Live on a Zero 2W (2026-11-23, one C5VRX, NTSC):** 59.9 fields/s with
-  `--workers 3` (active lines are decoded on worker threads), about 1.5
-  cores. Decoding a recording runs at 1.4× realtime with 3 workers and 1.06×
-  with 2. Two full decoders do not fit. The fuse mode
-  needs about 1.6× one receiver on a PC and has not been measured on the Pi;
-  nor has code clock recovery (2026-11-24, tested on recordings).
-- **Real C5VRX signal levels, chroma bandwidth and field-order conventions**
-  (`--voffset` / `--hshift` exist for alignment).
+Working on a Pi Zero 2W with two XIAO ESP32-C5 receivers (c5div-rx firmware) and
+an NTSC camera:
+
+- **Capture:** both receivers at 25 MS/s, gapless, recovering by itself if the DMA
+  channel is stopped. (The kernel `/dev/smi` path, `-s smidev`, loses 20–30 % of the
+  signal and is only a fallback.)
+- **Picture:** live colour video. C5 code clock recovery removed the coloured streaks
+  and the diagonal pattern in replays of a real recording.
+- **Diversity:** live fusion of both receivers.
+- **Web viewer** over the Pi's Wi-Fi access point.
+- **Operation:** starts at boot as a service, about 22 s after power-on; the Wi-Fi
+  jumper works.
+- **Speed:** two-receiver recordings play at 59.9 fields/s in real time with the web
+  viewer connected and no skipped fields. When the CPU is short, whole fields are
+  skipped and the log says so. The Pi gets warm (72 °C seen): use a heatsink.
+
+Not tested yet, or only in simulation:
+
+- **HDMI and AV:** no display test on record; the code is tested against a fake libdrm
+  (`test_outputs`). For AV on a Zero 2W it is open whether `enable_tvout` is needed
+  and whether switching works without a reboot.
+- **PAL:** synthetic source only.
+- **Raspberry Pi 3B:** same SoC family, never tried.
+- **Range and flight:** no test on record.
 
 ## Roadmap
 
-1. Bring-up on hardware: `probe`, then record real captures for offline tuning.
-3. NEON-tuned slicer and filters if the Zero 2W is short on CPU.
-4. A 2-D comb filter to reduce the remaining cross-colour/cross-luminance.
-5. Hardware H.264 (bcm2835 V4L2 M2M) for lower Wi-Fi bandwidth, plus an RTP/UDP output.
+1. HDMI and AV on real displays; PAL camera; Pi 3B.
+2. Comparison of the firmware's demodulators (D32, P64, U50P64, U85Q).
+3. A 2-D comb filter to reduce the remaining cross-colour/cross-luminance.
+4. Hardware H.264 (bcm2835 V4L2 M2M) for lower Wi-Fi bandwidth, plus an RTP/UDP output.
 
 The firmware is a git submodule ([fork of C5VRX](https://github.com/r-u-t-r-A/C5VRX),
 branch `c5div-lite`): `git submodule update --init` fetches it. The Pi does not need it.

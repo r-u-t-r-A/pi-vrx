@@ -1,7 +1,7 @@
 # Two-receiver diversity: status and next steps
 
-Updated 2026-11-24. Everything here was tested **on the PC only** (synthetic source and recordings of the
-real receiver A). Nothing from 2026-11-24 has run on the Pi, and receiver B is not wired.
+Fusion runs live on a Zero 2W with both receivers wired (2026-11-24). The picture-error figures below come from the
+synthetic source, the CPU figures from recordings played on the Pi.
 
 ## How it works
 
