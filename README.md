@@ -1,7 +1,7 @@
 # c5div: dual ESP32-C5 diversity video receiver for Raspberry Pi
 
 Two [C5VRX](https://github.com/Twotoz/C5VRX) receivers (Seeed XIAO ESP32-C5
-running the C5VRX firmware) feed a **Raspberry Pi Zero 2W or Pi 3B**. The Pi
+running the C5VRX firmware) feed a **Raspberry Pi Zero 2W**. The Pi
 combines both composite streams in software (diversity), decodes the result,
 and outputs the picture on **HDMI** and/or as a **web stream
 over a Wi-Fi access point** that phones and laptops can view.
@@ -15,7 +15,7 @@ over a Wi-Fi access point** that phones and laptops can view.
    ├─► XIAO C5 #A ──────────────┐
    └─► XIAO C5 #B ──────────┐   │   SMI 16-bit @ 25 MS/s (async)
                             ▼   ▼
-                  Pi Zero 2W / Pi 3B
+                  Pi Zero 2W
    capture ring ─► A: code clock + sync ─┐
                 └► B: code clock + sync ─┴─► fusion ─► decoder ─► bob deinterlace + OSD ─┬─► HDMI (KMS, YUV plane)
                                           (composite)                                    └─► MJPEG web viewer (Wi-Fi AP)
@@ -166,12 +166,11 @@ Not tested yet, or only in simulation:
   (`test_outputs`). For AV on a Zero 2W it is open whether `enable_tvout` is needed
   and whether switching works without a reboot.
 - **PAL:** synthetic source only.
-- **Raspberry Pi 3B:** same SoC family, never tried.
 - **Range and flight:** no test on record.
 
 ## Roadmap
 
-1. HDMI and AV on real displays; PAL camera; Pi 3B.
+1. HDMI and AV on real displays; PAL camera.
 2. Comparison of the firmware's demodulators (D32, P64, U50P64, U85Q).
 3. A 2-D comb filter to reduce the remaining cross-colour/cross-luminance.
 4. Hardware H.264 (bcm2835 V4L2 M2M) for lower Wi-Fi bandwidth, plus an RTP/UDP output.
