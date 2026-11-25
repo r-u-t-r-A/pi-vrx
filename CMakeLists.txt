@@ -10,7 +10,7 @@ endif()
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 add_compile_definitions(_GNU_SOURCE)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm")
-  # Pi Zero 2W / Pi 3: Cortex-A53
+  # Pi Zero 2W: Cortex-A53
   add_compile_options(-mcpu=cortex-a53)
 endif()
 

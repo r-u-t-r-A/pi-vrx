@@ -1,4 +1,4 @@
-# Wiring: two XIAO ESP32-C5 (C5VRX) → Raspberry Pi Zero 2W / Pi 3B
+# Wiring: two XIAO ESP32-C5 (C5VRX) → Raspberry Pi Zero 2W
 
 The Pi reads each C5's 6-bit video DAC bus **digitally**, tapped *before* the
 DAC resistors, with the Pi's Secondary Memory Interface (SMI) at 25 MS/s.
@@ -51,7 +51,7 @@ and I2S off, direct wiring works but has no margin.
 
 Notes:
 
-- Pin numbers are the Pi's 40-pin header (identical on the Zero 2W and 3B).
+- Pin numbers are the Pi's 40-pin header.
 - Keep the wires short (under ~10 cm) and give each C5 its own ground wire.
 - Powering both C5s from the Pi's 5 V pin is fine with a good 5 V / 2.5 A
   supply into the Pi.
@@ -86,8 +86,6 @@ switching while running gives no AV picture, reboot with the jumper fitted.
   bottom edge, 3 mm up from it. **TV** is 45.6 mm from the left board edge and its
   **GND** is 3.8 mm further right. Solder a short shielded wire (TV to the
   core, GND to the shield) and fix it with glue: the pads tear off easily.
-- **Pi 3B:** 3.5 mm jack, 4-pole. Tip and first ring are audio, second ring is
-  **ground**, sleeve is **video**. Many camcorder cables have these two swapped.
 - The output is 1 Vpp into 75 Ω, no extra parts needed.
 
 The standard follows the camera (576i PAL / 480i NTSC). `--av-std pal|ntsc` forces

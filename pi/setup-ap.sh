@@ -4,7 +4,7 @@
 #
 #   sudo ./pi/setup-ap.sh SSID PASSWORD [CHANNEL] [--yes]
 #
-# The Zero 2W / Pi 3B radio is 2.4 GHz only, which keeps it well away from
+# The Zero 2W radio is 2.4 GHz only, which keeps it well away from
 # the 5.8 GHz video band. Wi-Fi power saving is disabled for lower latency.
 # Undo with: sudo nmcli con delete c5div-ap
 set -euo pipefail

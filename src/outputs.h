@@ -9,7 +9,7 @@ typedef struct out_y4m out_y4m_t;
 out_y4m_t *out_y4m_open(const char *path, frame_pub_t *pub);
 void out_y4m_close(out_y4m_t *o);
 
-/* HDMI or composite AV through DRM/KMS (one at a time: on the Zero 2W / 3B
+/* HDMI or composite AV through DRM/KMS (one at a time: on the Zero 2W
  * they share the pixel pipeline). */
 typedef struct {
     bool av;            /* composite output instead of HDMI */

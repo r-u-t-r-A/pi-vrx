@@ -1,5 +1,5 @@
 /* Gapless SMI capture: SMI read cycles paced by the SMI DREQ into a circular
- * DMA chain, entirely from user space (Raspberry Pi Zero 2W / Pi 3, BCM2837).
+ * DMA chain, entirely from user space (Raspberry Pi Zero 2W, BCM2837).
  *
  * Why: the kernel /dev/smi read() path runs one programmed transfer per call
  * and then copies the block out of an uncached bounce buffer (~110 MB/s); the
@@ -559,7 +559,7 @@ int source_smidma_init(source_t *s)
         return -1;
     }
     if (!peripheral_base_is_2837()) {
-        LOGE("smi: gapless capture supports BCM2837 boards (Pi Zero 2W, Pi 3) only; try --source smidev");
+        LOGE("smi: gapless capture supports the Pi Zero 2W (BCM2837) only; try --source smidev");
         return -1;
     }
     const int chan = c->dma_chan;
