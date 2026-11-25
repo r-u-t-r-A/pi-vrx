@@ -1,6 +1,8 @@
 /* Output tests without a display: out_drm.c against a fake libdrm that looks
  * like vc4 on a Zero 2W with composite enabled, and the jumper debounce. */
 #include <errno.h>
+#include <pty.h>
+#include <termios.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -12,6 +14,7 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#include "chanlink.h"
 #include "common.h"
 #include "frame.h"
 #include "jumpers.h"
@@ -255,8 +258,58 @@ static out_drm_t *start(frame_pub_t *pub, drm_cfg_t c, video_std_t std)
 
 #define FULL(w, h) (last.cx == 0 && last.cy == 0 && last.cw == (w) && last.ch == (h))
 
+static int feed_chan(chan_parser_t *p, const char *s)
+{
+    int r = 0;
+    for (; *s; s++) {
+        const int c = chan_feed(p, (uint8_t)*s);
+        if (c)
+            r = c;
+    }
+    return r;
+}
+
+static void test_channel(void)
+{
+    printf("[channel messages]\n");
+    chan_parser_t p = {0};
+    CHECK(feed_chan(&p, "$C5,R3,5732*14\r\n") == 3, "the firmware test's message");
+    CHECK(feed_chan(&p, "$C5,R3,5732*15\r\n") == 0 && feed_chan(&p, "$C5,R3,5769*1A\r\n") == 0, "bad checksum or frequency refused");
+    CHECK(feed_chan(&p, "ESP-ROM:esp32c5\r\n$C5,R$C5,R3,5732*14\r\n") == 3, "after boot log and a torn message");
+    CHECK(feed_chan(&p, "$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n") == 0, "overlong line");
+
+    printf("[channel link on a pseudo terminal]\n");
+    int m, sl;
+    char name[64];
+    if (openpty(&m, &sl, name, NULL, NULL)) {
+        CHECK(false, "openpty");
+        return;
+    }
+    close(sl);
+    chanlink_t c;
+    chanlink_init(&c, name);
+    CHECK(!chanlink_poll(&c, 0) && c.fd >= 0 && chanlink_channel(&c, 0) == 0, "opens, channel unknown");
+    (void)!write(m, "$C5,R3,57", 9);
+    usleep(20000);
+    CHECK(!chanlink_poll(&c, 1.0), "half a message");
+    (void)!write(m, "32*14\r\n", 7);
+    usleep(20000);
+    CHECK(chanlink_poll(&c, 1.1) && chanlink_channel(&c, 1.1) == 3, "rest of it: R3");
+    CHECK(chanlink_channel(&c, 12.9) == 3 && chanlink_channel(&c, 13.2) == 0, "unknown again after 12 s of silence");
+    close(m);
+    chanlink_poll(&c, 14);
+    chanlink_poll(&c, 15);
+    CHECK(c.channel == 3, "port gone: no crash");
+    chanlink_close(&c);
+    chanlink_init(&c, "/dev/does-not-exist");
+    CHECK(!chanlink_poll(&c, 0) && c.fd < 0, "missing port is not fatal");
+    chanlink_init(&c, "none");
+    CHECK(!chanlink_poll(&c, 0) && !c.path, "off");
+}
+
 int main(void)
 {
+    test_channel();
     frame_pub_t pub;
     frame_pub_init(&pub, DEINT_BOB, false);
     out_drm_t *o;

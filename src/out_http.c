@@ -67,7 +67,7 @@ static const char k_page[] =
     "(e.requestFullscreen||e.webkitRequestFullscreen||(()=>{})).call(e)};"
     "v.onerror=()=>setTimeout(()=>{v.src='/stream.mjpg?'+Date.now()},1000);"
     "async function poll(){try{const r=await fetch('/status.json',{cache:'no-store'});const j=await r.json();"
-    "s.textContent=j.rx.map(x=>'RX '+x.name+': '+(x.locked?(x.std+' '+x.snr_db.toFixed(1)+' dB'):'no lock')"
+    "s.textContent=('channel' in j?'Channel: '+(j.channel||'--')+'\\n':'')+j.rx.map(x=>'RX '+x.name+': '+(x.locked?(x.std+' '+x.snr_db.toFixed(1)+' dB'):'no lock')"
     "+'  use '+Math.round(x.use*100)+'%').join('\\n')+'\\n'+j.fps.toFixed(1)+' fps  '+j.mode;"
     "}catch(e){s.textContent='status unavailable'}setTimeout(poll,500)}poll();"
     "</script></body></html>";

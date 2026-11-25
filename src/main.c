@@ -11,6 +11,7 @@
 #include <strings.h>
 #include <unistd.h>
 
+#include "chanlink.h"
 #include "common.h"
 #include "decoder.h"
 #include "diversity.h"
@@ -40,6 +41,8 @@ typedef struct {
     double t_last;
     uint64_t f_last;
     uint64_t skip_last;
+    bool chan_on;           /* channel link configured */
+    atomic_int channel;     /* 1..8, 0 unknown */
     float fps;
 } app_t;
 
@@ -94,6 +97,14 @@ static size_t status_json(void *ctx, char *buf, size_t n)
                               ",\"fused\":{\"locked\":%s,\"snr_db\":%.1f,\"aligned\":%s,\"delay_us\":%.3f}",
                               atomic_load(&s->locked) ? "true" : "false", atomic_load(&s->snr_db),
                               atomic_load(&fs->aligned) ? "true" : "false", atomic_load(&fs->delay_us));
+        if (o >= n) return 0;
+    }
+    if (a->chan_on) {
+        const int ch = atomic_load(&a->channel);
+        if (ch)
+            o += (size_t)snprintf(buf + o, n - o, ",\"channel\":\"R%d\"", ch);
+        else
+            o += (size_t)snprintf(buf + o, n - o, ",\"channel\":null");
         if (o >= n) return 0;
     }
     o += (size_t)snprintf(buf + o, n - o,
@@ -161,6 +172,8 @@ static void print_status(app_t *a)
     decoder_t *fused = pipeline_fused(a->pl);
     char line[512];
     int o = 0;
+    if (a->chan_on && atomic_load(&a->channel))
+        o += snprintf(line + o, sizeof(line) - (size_t)o, "R%d | ", atomic_load(&a->channel));
     for (int r = 0; r < a->nrx; r++) {
         decoder_stats_t *s = decoder_stats(pipeline_rx(a->pl, r));
         if (atomic_load(&s->locked))
@@ -205,6 +218,8 @@ static void usage(void)
 "  -o, --output LIST       comma list of hdmi, av, web, jumpers, y4m:PATH, none  (default hdmi,web)\n"
 "                          av: composite video (instead of hdmi; they cannot run together)\n"
 "                          jumpers: GPIO4-GND fitted = av, open = hdmi; GPIO5-GND fitted = web\n"
+"      --channel-uart DEV  serial port the master receiver's channel arrives on, or none\n"
+"                                                                    (default /dev/serial0 with -s smi)\n"
 "      --av-std S          auto (same as the camera) | pal | ntsc            (default auto)\n"
 "      --av-progressive    288p/240p instead of 576i/480i\n"
 "      --hdmi-mode M       auto | WxH@HZ                                     (default auto)\n"
@@ -271,7 +286,7 @@ int main(int argc, char **argv)
     bool div_given = false;
     video_std_t av_std = STD_UNKNOWN;
     bool av_prog = false;
-    const char *jumper_sim = NULL;
+    const char *jumper_sim = NULL, *chan_uart = NULL;
     source_cfg_t scfg;
     source_cfg_default(&scfg);
     decoder_cfg_t dcfg;
@@ -284,7 +299,7 @@ int main(int argc, char **argv)
     enum {
         O_RX = 256, O_FS, O_SMI_TIMING, O_SMI_SWAP, O_BLOCK, O_SECONDS, O_FAST, O_HDMI_MODE, O_STRETCH,
         O_WEB_PORT, O_WEB_FPS, O_JPEG_Q, O_DEINT, O_NO_OSD, O_STD, O_DIV, O_HYST, O_BLEND_DB, O_MONO, O_SAT,
-        O_DMA_CHAN, O_DMA_FORCE, O_WORKERS, O_CONTRAST, O_BRIGHT, O_HSHIFT, O_VOFF, O_NO_MEDIAN, O_HQ, O_NO_CAVG, O_SN, O_SC, O_SF, O_SG, O_SFV, O_SDL, O_RECLK, O_SPPM, O_AVSTD, O_AVPROG, O_JSIM,
+        O_DMA_CHAN, O_DMA_FORCE, O_WORKERS, O_CONTRAST, O_BRIGHT, O_HSHIFT, O_VOFF, O_NO_MEDIAN, O_HQ, O_NO_CAVG, O_SN, O_SC, O_SF, O_SG, O_SFV, O_SDL, O_RECLK, O_SPPM, O_AVSTD, O_AVPROG, O_JSIM, O_CHAN,
     };
     static const struct option opts[] = {
         {"source", required_argument, 0, 's'}, {"output", required_argument, 0, 'o'},
@@ -303,7 +318,7 @@ int main(int argc, char **argv)
         {"hshift", required_argument, 0, O_HSHIFT}, {"voffset", required_argument, 0, O_VOFF},
         {"median", no_argument, 0, O_NO_MEDIAN}, {"hq", no_argument, 0, O_HQ}, {"no-chroma-avg", no_argument, 0, O_NO_CAVG},
         {"synth-noise", required_argument, 0, O_SN}, {"synth-clicks", required_argument, 0, O_SC},
-        {"synth-fade", required_argument, 0, O_SF}, {"synth-gaps", required_argument, 0, O_SG}, {"synth-fakevs", required_argument, 0, O_SFV}, {"synth-delay", required_argument, 0, O_SDL}, {"av-std", required_argument, 0, O_AVSTD}, {"av-progressive", no_argument, 0, O_AVPROG}, {"jumper-sim", required_argument, 0, O_JSIM},
+        {"synth-fade", required_argument, 0, O_SF}, {"synth-gaps", required_argument, 0, O_SG}, {"synth-fakevs", required_argument, 0, O_SFV}, {"synth-delay", required_argument, 0, O_SDL}, {"av-std", required_argument, 0, O_AVSTD}, {"channel-uart", required_argument, 0, O_CHAN}, {"av-progressive", no_argument, 0, O_AVPROG}, {"jumper-sim", required_argument, 0, O_JSIM},
         {"no-reclock", no_argument, 0, O_RECLK}, {"synth-ppm", required_argument, 0, O_SPPM},
         {0, 0, 0, 0},
     };
@@ -368,6 +383,7 @@ int main(int argc, char **argv)
         case O_AVSTD:
             av_std = !strcmp(optarg, "pal") ? STD_PAL : !strcmp(optarg, "ntsc") ? STD_NTSC : STD_UNKNOWN;
             break;
+        case O_CHAN: chan_uart = optarg; break;
         case O_AVPROG: av_prog = true; break;
         case O_JSIM: jumper_sim = optarg; break;    /* testing: file instead of GPIOs */
         case O_RECLK: dcfg.reclock = false; break;
@@ -437,11 +453,15 @@ int main(int argc, char **argv)
     if (!div_given && nrx == 2)
         vcfg.mode = DIV_FUSE;
     pipeline_cfg_t pc = {.dec = dcfg, .div = vcfg, .nrx = nrx, .realtime = src->realtime};
+    if (!chan_uart && (!strcmp(src_spec, "smi") || !strcmp(src_spec, "smidev")))
+        chan_uart = "/dev/serial0";
+    chanlink_t chan;
+    chanlink_init(&chan, chan_uart);
     pipeline_t *pl = pipeline_new(&pc, &ring, &pub);
     if (!pl)
         return 1;
     app_t app = {.pl = pl, .nrx = nrx, .dv = pipeline_diversity(pl), .src = src, .mode = pipeline_mode(pl),
-                 .t_last = now_s()};
+                 .t_last = now_s(), .chan_on = chan.path != NULL};
 
     out_y4m_t *y4m = NULL;
     outputs_t out = {.pub = &pub};
@@ -496,6 +516,16 @@ int main(int argc, char **argv)
         update_fps(&app);
         if (use_jumpers)
             poll_jumpers(&out, &jio, jumper_sim, &jf, want_web);
+        const double t_now = now_s();
+        chanlink_poll(&chan, t_now);
+        const int ch = chanlink_channel(&chan, t_now);
+        if (ch != atomic_load(&app.channel)) {
+            atomic_store(&app.channel, ch);
+            if (ch)
+                LOGI("channel R%d", ch);
+            else
+                LOGW("channel link: nothing heard for %.0f s", CHAN_STALE_S);
+        }
         if (now_s() >= next_print) {
             next_print += 2.0;
             print_status(&app);
@@ -511,6 +541,7 @@ int main(int argc, char **argv)
     frame_pub_set_eof(&pub);
     set_outputs(&out, VID_NONE, false);
     jumper_close(&jio);
+    chanlink_close(&chan);
     out_y4m_close(y4m);
 
     div_stats_t *ds = diversity_stats(app.dv);
