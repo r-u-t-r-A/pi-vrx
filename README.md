@@ -156,6 +156,8 @@ an NTSC camera:
   and the diagonal pattern in replays of a real recording.
 - **Diversity:** live fusion of both receivers.
 - **Web viewer** over the Pi's Wi-Fi access point.
+- **Composite AV output:** tested on a real display. Latency from camera to screen is
+  300–400 ms.
 - **Operation:** starts at boot as a service, about 22 s after power-on; the Wi-Fi
   jumper works.
 - **Speed:** two-receiver recordings play at 59.9 fields/s in real time with the web
@@ -164,15 +166,15 @@ an NTSC camera:
 
 Not tested yet, or only in simulation:
 
-- **HDMI and AV:** no display test on record; the code is tested against a fake libdrm
-  (`test_outputs`). For AV on a Zero 2W it is open whether `enable_tvout` is needed
-  and whether switching works without a reboot.
+- **HDMI:** no display test on record; the code is tested against a fake libdrm
+  (`test_outputs`).
+- **Switching between HDMI and AV while running** (AV jumper) without a reboot.
 - **PAL:** synthetic source only.
 - **Range and flight:** no test on record.
 
 ## Roadmap
 
-1. HDMI and AV on real displays; PAL camera.
+1. HDMI on a real display; PAL camera.
 2. Comparison of the firmware's demodulators (D32, P64, U50P64, U85Q).
 3. A 2-D comb filter to reduce the remaining cross-colour/cross-luminance.
 4. Hardware H.264 (bcm2835 V4L2 M2M) for lower Wi-Fi bandwidth, plus an RTP/UDP output.

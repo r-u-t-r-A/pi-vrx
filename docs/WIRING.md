@@ -71,7 +71,7 @@ channel button and tells the slave and the Pi which channel it is on.
 | button | master XIAO **D10** to GND |
 | GND | common (already there for the data bus) |
 
-Remove the button wire from the slave's D10 if you had one button on both. Both
+Only the master has a button; the slave's D10 is the link input. Both
 XIAOs run the same firmware (c5div-rx with channel link); the one that hears the other
 becomes the slave. Details: `firmware/README.md`.
 
@@ -108,6 +108,8 @@ switching while running gives no AV picture, reboot with the jumper fitted.
   **GND** is 3.8 mm further right. Solder a short shielded wire (TV to the
   core, GND to the shield) and fix it with glue: the pads tear off easily.
 - The output is 1 Vpp into 75 Ω, no extra parts needed.
+
+Tested on a real display: it works, with 300–400 ms latency from camera to screen.
 
 The standard follows the camera (576i PAL / 480i NTSC). `--av-std pal|ntsc` forces
 one, `--av-progressive` outputs 288p/240p for displays that flicker on interlaced video.
