@@ -8,7 +8,7 @@ high byte.
 ## Receiver firmware (both receivers)
 
 **Recommended: c5div-rx** (`firmware/`, a reduced C5VRX-5 fork). Bit 2 is
-already on D3, there is no menu, and one button cycles raceband R1–R8:
+already on D3, there is no menu, and the BOOT button cycles raceband R1–R8:
 
 ```
 cd firmware && tools/build-container.sh
@@ -16,10 +16,10 @@ cd firmware && tools/build-container.sh
 esptool.py --chip esp32c5 -p /dev/ttyACM0 write_flash 0x0 build/c5div_rx_merged.bin
 ```
 
-Do the same for the second XIAO. Wire a **push button from D10 to GND on one of
-them** (the master) and the [channel link](#channel-link) to the other: a press moves
-both to the next channel, a 2 s hold puts both on R1. See `firmware/README.md` for
-the one-time calibration (8 s hold, on each XIAO).
+Do the same for the second XIAO and wire the [channel link](#channel-link). The
+BOOT button of the master changes the channel of both: a press moves both to the next
+channel, a 2 s hold puts both on R1. See `firmware/README.md` for the one-time
+calibration (8 s hold of BOOT, on each XIAO).
 
 **Alternative: stock C5VRX** (web flasher on the C5VRX website):
 
@@ -61,17 +61,16 @@ Notes:
 
 ## Channel link
 
-Both receivers must be on the same channel. The **master** (either one) has the
-channel button and tells the slave and the Pi which channel it is on.
+Both receivers must be on the same channel. You change the channel with the BOOT
+button of the **master** (either one); it tells the slave and the Pi which channel it is on.
 
 | From | To |
 |---|---|
 | master XIAO **D6** | slave XIAO **D10** |
 | master XIAO **D6** (same wire) | Pi **GPIO15 / RXD, pin 10** |
-| button | master XIAO **D10** to GND |
 | GND | common (already there for the data bus) |
 
-Only the master has a button; the slave's D10 is the link input. Both
+Nothing else goes on D10: it is not a button. Both
 XIAOs run the same firmware (c5div-rx with channel link); the one that hears the other
 becomes the slave. Details: `firmware/README.md`.
 
