@@ -43,6 +43,10 @@ typedef struct {
     double synth_dip_every;    /* s; >0: short, independent deep fades (dips) per receiver */
     double synth_dip_len;      /* s; dip duration */
     float synth_dip_noise;     /* noise during a dip */
+    float synth_dip_keep;      /* fraction of the video left during a dip (0: noise only, no sync) */
+    double synth_jump_at;      /* s; >0: from here on the video of all receivers is synth_jump_us later */
+    double synth_jump_us;      /* (a camera/VTX restart: new line and field phase) */
+    double synth_std_at;       /* s; >0: from here on the other standard (PAL <-> NTSC: another camera) */
     bool synth_realtime;
 
     /* file */

@@ -14,6 +14,7 @@
 
 int g_verbose = 0;
 atomic_bool g_running = true;
+static bool g_flywheel = true;   /* decoder flywheel for the next run() */
 
 typedef struct {
     frame_t last;
@@ -24,6 +25,7 @@ typedef struct {
     double worst_y;             /* worst single-frame luma RMS error */
     double bar_sum[8];          /* per-bar luma error sums: the mean is bias (gain/level), the rest noise */
     uint64_t bar_n[8];
+    uint64_t rows, good_rows;   /* bar rows, and those that show the bars in the right place */
 } capture_t;
 
 /* Picture error against the synthetic reference, in the (static) colour
@@ -32,6 +34,22 @@ static void add_error(capture_t *c, const frame_t *f)
 {
     double fy = 0;
     uint64_t fn = 0;
+    /* Rows that show the bars at the right level and position (scraps of
+     * signal decoded in place); a shifted or noisy row fails. */
+    for (int y = (int)(0.05 * f->h); y < (int)(0.55 * f->h); y++) {
+        double se = 0;
+        int n = 0;
+        for (int i = 0; i < 8; i++) {
+            double Ye, Ue, Ve;
+            cvbs_synth_picture((i + 0.5) / 8.0, 0.3, 0, &Ye, &Ue, &Ve);
+            for (int x = 90 * i + 25; x < 90 * i + 65; x += 2, n++) {
+                const double e = f->y[(size_t)y * f->w + x] - (16 + 219 * Ye);
+                se += e * e;
+            }
+        }
+        c->rows++;
+        c->good_rows += sqrt(se / n) < 12.0;
+    }
     for (int i = 0; i < 8; i++) {
         double Ye, Ue, Ve;
         cvbs_synth_picture((i + 0.5) / 8.0, 0.3, 0, &Ye, &Ue, &Ve);
@@ -79,6 +97,8 @@ typedef struct {
     float fused_snr, delay_us;
     bool aligned;
     uint64_t realigns, fused_losses;
+    uint64_t fly_entries, fly_resyncs;      /* the decoder that makes the picture */
+    double good;                            /* bar rows shown right, per row of every field expected */
     double rms_y, rms_c, bias_y, noise_y;   /* rms_y^2 = bias_y^2 + noise_y^2 */
 } result_t;
 
@@ -102,6 +122,7 @@ static int run(const char *spec, source_cfg_t sc, div_cfg_t vc, int nrx, result_
     pc.div.realtime = false;
     decoder_cfg_default(&pc.dec);
     pc.dec.fs_nom = sc.fs;
+    pc.dec.flywheel = g_flywheel;
     pipeline_t *pl = pipeline_new(&pc, &ring, &pub);
     pipeline_start(pl);
     source_start(src, &ring);
@@ -124,6 +145,19 @@ static int run(const char *spec, source_cfg_t sc, div_cfg_t vc, int nrx, result_
         res->delay_us = atomic_load(&fs->delay_us);
         res->aligned = atomic_load(&fs->aligned);
         res->realigns = atomic_load(&fs->realigns);
+    }
+    {
+        decoder_t *pd = pipeline_fused(pl) ? pipeline_fused(pl) : pipeline_rx(pl, 0);
+        res->fly_entries = atomic_load(&decoder_stats(pd)->fly_entries);
+        res->fly_resyncs = atomic_load(&decoder_stats(pd)->fly_resyncs);
+    }
+    /* A frozen picture shows nothing new: count against all the fields that should have come. */
+    {
+        const std_params_t *sp = std_params(sc.synth_std);
+        const double expect = sc.seconds * sp->field_rate_num / sp->field_rate_den - res->cap.skip;
+        const double per = res->cap.frames > (uint64_t)res->cap.skip
+                               ? (double)res->cap.rows / (double)(res->cap.frames - (uint64_t)res->cap.skip) : 0;
+        res->good = per > 0 && expect > 0 ? (double)res->cap.good_rows / (per * expect) : 0;
     }
     div_stats_t *ds = diversity_stats(pipeline_diversity(pl));
     res->fields_out = atomic_load(&ds->fields_out);
@@ -444,14 +478,96 @@ static void test_fuse(void)
     frame_release(&r.cap.last);
 }
 
+/* Signal only in short bursts ("scraps"), noise with no sync in between. */
+static source_cfg_t scraps_cfg(double seconds, double burst, double dip)
+{
+    source_cfg_t sc = fuse_cfg(seconds, 3.3);
+    sc.synth_dip_every = burst;     /* mean burst length (0.3..1.7 x) */
+    sc.synth_dip_len = dip;
+    sc.synth_dip_noise = 20;
+    sc.synth_dip_keep = 0;
+    return sc;
+}
+
+static void test_flywheel(void)
+{
+    div_cfg_t vc;
+    div_cfg_default(&vc);
+    result_t r, off;
+    static const struct { const char *name; double burst, dip; } cases[] = {
+        {"50 %", 0.004, 0.004}, {"20 %", 0.002, 0.008}, {"10 %", 0.0015, 0.0135},
+    };
+    for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        printf("[flywheel: one receiver, signal %s of the time in 1-4 ms scraps]\n", cases[k].name);
+        const source_cfg_t sc = scraps_cfg(2.0, cases[k].burst, cases[k].dip);
+        const double duty = cases[k].burst / (cases[k].burst + cases[k].dip);
+        g_flywheel = false;
+        run("synth:pal", sc, vc, 1, &off);
+        g_flywheel = true;
+        run("synth:pal", sc, vc, 1, &r);
+        CHECK(r.fields_out >= 95, "fields out %llu of 100 (without flywheel %llu)", (unsigned long long)r.fields_out,
+              (unsigned long long)off.fields_out);
+        CHECK(r.good > 0.7 * duty, "%.0f %% of rows show the picture in place (signal %.0f %%; without flywheel %.0f %%)",
+              100 * r.good, 100 * duty, 100 * off.good);
+        CHECK(r.fly_resyncs == 0, "no phase jumps (re-syncs %llu; the timing never changed)", (unsigned long long)r.fly_resyncs);
+        frame_release(&off.cap.last);
+        frame_release(&r.cap.last);
+    }
+
+    printf("[flywheel: two receivers fused, 20 %% scraps each, independent]\n");
+    vc.mode = DIV_FUSE;
+    run("synth:pal", scraps_cfg(2.0, 0.002, 0.008), vc, 2, &r);
+    CHECK(r.fields_out >= 95 && r.good > 0.15, "fields out %llu, %.0f %% of rows in place", (unsigned long long)r.fields_out,
+          100 * r.good);
+    frame_release(&r.cap.last);
+    vc.mode = DIV_AUTO;
+
+    printf("[flywheel: no signal for 2 s, then back]\n");
+    source_cfg_t sc = fuse_cfg(3.0, 3.3);
+    sc.synth_off_from[0] = 0.5;
+    sc.synth_off_to[0] = 2.5;
+    run("synth:pal", sc, vc, 1, &r);
+    CHECK(r.fields_out >= 145, "fields out %llu of 150", (unsigned long long)r.fields_out);
+    CHECK(r.locked[0] && r.fly_entries >= 1, "locked again (flywheel entered %llu times)", (unsigned long long)r.fly_entries);
+    check_bars(&r.cap.last, "after the outage");
+    frame_release(&r.cap.last);
+
+    printf("[flywheel: NTSC lost, comes back as PAL (another camera)]\n");
+    sc = fuse_cfg(2.0, 3.3);
+    sc.synth_off_from[0] = 0.5;
+    sc.synth_off_to[0] = 0.8;
+    sc.synth_std_at = 0.65;
+    run("synth:ntsc", sc, vc, 1, &r);
+    CHECK(r.locked[0] && r.std[0] == STD_PAL, "locked, %s detected", std_name(r.std[0]));
+    CHECK(r.fields_out >= 100, "fields out %llu (~30 NTSC + ~60 PAL + the outage)", (unsigned long long)r.fields_out);
+    check_bars(&r.cap.last, "after the switch");
+    frame_release(&r.cap.last);
+
+    static const double jumps[] = {23.7, 5 * 64.0 + 23.7};   /* new line phase; new line and field phase */
+    for (int k = 0; k < 2; k++) {
+        printf("[flywheel: VTX restart, video %.1f us later]\n", jumps[k]);
+        sc = fuse_cfg(2.0, 3.3);
+        sc.synth_off_from[0] = 0.5;
+        sc.synth_off_to[0] = 0.8;
+        sc.synth_jump_at = 0.65;
+        sc.synth_jump_us = jumps[k];
+        run("synth:pal", sc, vc, 1, &r);
+        CHECK(r.fields_out >= 95, "fields out %llu of 100", (unsigned long long)r.fields_out);
+        CHECK(r.locked[0] && r.fly_resyncs == 1, "locked, one re-sync (%llu)", (unsigned long long)r.fly_resyncs);
+        check_bars(&r.cap.last, "after the restart");
+        frame_release(&r.cap.last);
+    }
+}
+
 /* Mode comparison on picture error: `test_pipeline bench`. */
 static void bench(const char *only)
 {
-    static const struct { const char *name; float na, nb, clicks, fade, dip; } cases[] = {
-        {"clean", 0.6f, 0.6f, 0, 0, 0},       {"noise 4/4", 4, 4, 0, 0, 0},
-        {"noise 8/8", 8, 8, 0, 0, 0},         {"noise 4/8", 4, 8, 0, 0, 0},
-        {"clicks 2/line", 1.5f, 1.5f, 2, 0, 0}, {"clicks 8/line", 1.5f, 1.5f, 8, 0, 0},
-        {"slow fades", 1, 1, 0, 14, 0},       {"2 ms dips", 1, 1, 0, 0, 20},
+    static const struct { const char *name; float na, nb, clicks, fade, dip; double burst, len; } cases[] = {
+        {"clean", 0.6f, 0.6f, 0, 0, 0, 0, 0},       {"noise 4/4", 4, 4, 0, 0, 0, 0, 0},
+        {"noise 8/8", 8, 8, 0, 0, 0, 0, 0},         {"noise 4/8", 4, 8, 0, 0, 0, 0, 0},
+        {"clicks 2/line", 1.5f, 1.5f, 2, 0, 0, 0, 0}, {"clicks 8/line", 1.5f, 1.5f, 8, 0, 0, 0, 0},
+        {"slow fades", 1, 1, 0, 14, 0, 0, 0},       {"2 ms dips", 1, 1, 0, 0, 20, 0.02, 0.002},
+        {"scraps 50%", 1, 1, 0, 0, 20, 0.004, 0.004}, {"scraps 20%", 1, 1, 0, 0, 20, 0.002, 0.008},
     };
     static const struct { const char *name; div_mode_t m; int nrx; } modes[] = {
         {"A only", DIV_FORCE_A, 2}, {"B only", DIV_FORCE_B, 2}, {"select", DIV_SELECT, 2},
@@ -474,18 +590,20 @@ static void bench(const char *only)
                 sc.synth_fade_noise = cases[k].fade;
             }
             if (cases[k].dip > 0) {
-                sc.synth_dip_every = 0.02;
-                sc.synth_dip_len = 0.002;
+                sc.synth_dip_every = cases[k].burst;
+                sc.synth_dip_len = cases[k].len;
                 sc.synth_dip_noise = cases[k].dip;
+                if (cases[k].len > cases[k].burst)
+                    sc.synth_dip_keep = 0;   /* scraps: nothing but noise in between */
             }
             div_cfg_t vc;
             div_cfg_default(&vc);
             vc.mode = modes[m].m;
             result_t r;
             run("synth:pal", sc, vc, modes[m].nrx, &r);
-            printf("  %-7s luma bias %5.1f noise %5.1f  chroma %4.1f  worst %5.1f [%llu] losses A %llu B %llu fused %llu\n",
-                   modes[m].name, r.bias_y, r.noise_y, r.rms_c, r.cap.worst_y, (unsigned long long)r.cap.frames, (unsigned long long)r.lock_losses[0],
-                   (unsigned long long)r.lock_losses[1], (unsigned long long)r.fused_losses);
+            printf("  %-7s luma bias %5.1f noise %5.1f  chroma %4.1f  worst %5.1f [%llu] in place %3.0f%%  losses A %llu B %llu fused %llu\n",
+                   modes[m].name, r.bias_y, r.noise_y, r.rms_c, r.cap.worst_y, (unsigned long long)r.cap.frames, 100 * r.good,
+                   (unsigned long long)r.lock_losses[0], (unsigned long long)r.lock_losses[1], (unsigned long long)r.fused_losses);
             fflush(stdout);
             frame_release(&r.cap.last);
         }
@@ -497,8 +615,17 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "-v"))
         g_verbose = 1;
     if (argc > 1 && !strcmp(argv[1], "bench")) {
-        bench(argc > 2 ? argv[2] : NULL);
+        /* bench [case] [nofly] */
+        const char *only = argc > 2 && strcmp(argv[2], "nofly") ? argv[2] : NULL;
+        g_flywheel = !(argc > 2 && !strcmp(argv[argc - 1], "nofly"));
+        printf("flywheel %s\n", g_flywheel ? "on" : "off");
+        bench(only);
         return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "fly")) {
+        g_verbose = argc > 2;
+        test_flywheel();
+        return failures != 0;
     }
     if (argc > 1 && !strcmp(argv[1], "fuse")) {
         g_verbose = argc > 2;
@@ -514,6 +641,7 @@ int main(int argc, char **argv)
     test_single();
     test_reclock();
     test_fuse();
+    test_flywheel();
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

@@ -32,6 +32,7 @@ void source_cfg_default(source_cfg_t *c)
     c->synth_gap_every = 0;
     c->synth_gap_us = 30;
     c->synth_skew = 0.05f;
+    c->synth_dip_keep = 0.3f;
     c->synth_realtime = true;
     c->file_realtime = true;
 }

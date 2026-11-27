@@ -23,6 +23,7 @@
 
 typedef struct {
     cvbs_synth_t cs;
+    cvbs_synth_t cs2;      /* the other standard, from synth_std_at on */
     uint64_t rng;
 } synth_priv_t;
 
@@ -98,9 +99,11 @@ static void *synth_thread(void *arg)
                 const long m = (long)tc;
                 if (m != m_last[r]) {
                     const double tm = ((double)m - c->synth_phase[r]) / rate;
-                    double v = r ? v_prev : cvbs_synth_eval(&p->cs, tm);
+                    const double tj = c->synth_jump_at > 0 && tm >= c->synth_jump_at ? tm - c->synth_jump_us * 1e-6 : tm;
+                    const cvbs_synth_t *cs = c->synth_std_at > 0 && tm >= c->synth_std_at ? &p->cs2 : &p->cs;
+                    double v = r ? v_prev : cvbs_synth_eval(cs, tj);
                     if (r && own_clocks)
-                        v = cvbs_synth_eval(&p->cs, tm);
+                        v = cvbs_synth_eval(cs, tj);
                     v_prev = v;
                     if (tm >= fake_t) {
                         const double hl = 0.5 * line_s, ph = tm - fake_t;
@@ -124,7 +127,7 @@ static void *synth_thread(void *arg)
                         const double dly = c->synth_delay_step > 0 && tm >= c->synth_delay_step ? c->synth_delay2_us
                                                                                                  : c->synth_delay_us;
                         if (r == 1 && dly != 0)
-                            vr = cvbs_synth_eval(&p->cs, tm - dly * 1e-6);
+                            vr = cvbs_synth_eval(cs, tj - dly * 1e-6);
                         if (c->synth_dip_every > 0) {
                             if (tm >= dip_end[r]) {
                                 if (dip_end[r] > 0 || tm >= 0.15) {   /* leave time to lock first */
@@ -133,14 +136,15 @@ static void *synth_thread(void *arg)
                                 }
                             } else if (tm >= dip_start[r]) {
                                 sigma = c->synth_dip_noise;
-                                vr *= 0.3;
+                                vr *= c->synth_dip_keep;
                             }
                         }
                         if (tm >= c->synth_off_from[r] && tm < c->synth_off_to[r]) {
                             vr = 0;
                             sigma = 15.0f;
                         }
-                        float x = C5_BLANK + (float)(vr * c->synth_sync[r] * sync_ratio) + gauss(&p->rng) * sigma;
+                        float x = C5_BLANK + (float)(vr * c->synth_sync[r] * (cs == &p->cs ? sync_ratio : cs->sp->sync_ratio)) +
+                                  gauss(&p->rng) * sigma;
                         float pclick = c->synth_clicks[r] * (1.0f + 4.0f * fade[r]) / (float)(line_s * C5_RATE);
                         if (click_left[r] == 0 && pclick > 0 && urand(&p->rng) < pclick) {
                             click_left[r] = 1 + (int)(urand(&p->rng) * 2);
@@ -194,6 +198,7 @@ int source_synth_init(source_t *s)
     if (!p)
         return -1;
     cvbs_synth_init(&p->cs, s->cfg.synth_std);
+    cvbs_synth_init(&p->cs2, s->cfg.synth_std == STD_PAL ? STD_NTSC : STD_PAL);
     p->rng = 0x9E3779B97F4A7C15ull;
     s->priv = p;
     s->thread_fn = synth_thread;
