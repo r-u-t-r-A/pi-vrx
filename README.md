@@ -67,14 +67,24 @@ follow the VTX deviation and the C5's OUTPUT setting:
   subcarrier oscillator, PAL V-switch from consecutive bursts, ACC, a colour
   killer, and luma by chroma remodulation/subtraction.
 - **Quality:** per-line SNR from porch noise, which drives the diversity choice.
+- **Flywheel (sync reconstruction):** when the sync is lost, the line and field timing
+  keep going from the last clean stretch, like the flywheel of an analog TV. Every line
+  is still decoded, so scraps of picture show up in the right place and the rest is
+  snow, instead of the picture freezing. The decoder goes back to the real sync once 7
+  of 8 lines agree on its position, also when it moved (a restarted camera or VTX).
+  With no signal at all it shows snow until the signal returns. `--no-flywheel` turns
+  it off; the overlay shows `flywheel` and the signal bar turns orange while it runs.
 
 With two receivers the default is **fuse** (`src/fusion.c`): the two composite
 streams are aligned to a few ns, weighted by each receiver's noise line by line,
 FM clicks on one are replaced from the other, and one decoder decodes the
 result. The alternative combiner (`src/diversity.c`, `--div auto|select|blend`)
 runs two full decoders, pairs their fields, and per line **selects** the
-better receiver (with hysteresis) or **blends** both. Lines that are missing (sync loss, capture gaps) keep the
-previous frame's content instead of smearing.
+better receiver (with hysteresis) or **blends** both. Fusion and the flywheel work
+together: each receiver's timing is held through its own dropouts, so the fusion keeps
+weighting line by line, and the fused picture keeps its timing when both drop out.
+Lines that are missing (capture gaps) keep the previous frame's content instead of
+smearing.
 
 ## Quick start without hardware
 
@@ -133,6 +143,7 @@ sudo c5div record --seconds 5 -O cap.raw   # raw capture, replay with -s file:ca
 --rx A                  one receiver only (8-bit SMI)
 --div fuse|auto|select|blend|a|b    diversity mode (default fuse)
 --no-reclock            skip code clock recovery
+--no-flywheel           stop decoding when the sync is lost (freezes on the last picture)
 --std pal|ntsc          skip auto-detection
 --deint weave           full vertical resolution, combing on motion (default bob = 50/60 fps)
 --hq                    20-tap sinc resampler (more CPU)
@@ -170,6 +181,9 @@ Not tested yet, or only in simulation:
   (`test_outputs`).
 - **Switching between HDMI and AV while running** (AV jumper) without a reboot.
 - **PAL:** synthetic source only.
+- **Flywheel / weak signal:** tested on the synthetic source (signal in 1–4 ms scraps,
+  outages, a restarted VTX, another camera standard after an outage) and on recordings;
+  not yet live on the Pi.
 - **Range and flight:** no test on record.
 
 ## Roadmap

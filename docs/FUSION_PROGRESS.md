@@ -16,6 +16,34 @@ ring -> reclock B -> sync-only decoder B -> fusion_push  > fusion thread -> one 
 - `src/pipeline.c`: threads and wiring, used by the app and the tests.
 - Blocks carry codes, timing and the per-line noise log together, so results do not depend on thread timing.
 
+## Flywheel (sync reconstruction)
+
+`ST_FLY` in `src/decoder.c`. Before it, a sync loss of 50 lines dropped all timing; re-acquisition needed 8 clean lines in a row
+plus a full vsync, which scraps rarely give, so the picture froze (partial fields keep old content for missing lines).
+
+- Entered after 4 lines without sync, once the standard, levels and vertical timing are known. The phase and line period come
+  from the last clean stretch (8 matched lines), the period as a long-term average: the PLL's own period moves with every
+  correction (beta) and was off by ~230 ppm after short bursts, which put the sync 1-3 us off after an 8 ms dip.
+- Every line is decoded; levels are held; the vertical flywheel keeps making fields. Snow forever with no signal (user's choice).
+- Back to lock: 7 of 8 lines with a sync within 1 us of the prediction, or 7 of 8 with a sync within 0.4 us of one place
+  elsewhere (moved timing: phase jump). Noise pulses do not pass that; a looser histogram vote gave ~1 false jump per 10 ms of
+  noise. Steady syncs at another line period (other camera or standard) go back to full acquisition.
+- On for all decoders, also the sync-only ones in fuse mode: their line logs keep coming, so the fusion weights line by line
+  through dropouts (fuse, 20 % scraps per receiver: 28 % -> 36 % of rows in place). `locked` stays false while flying, so
+  alignment only uses locked timing. The diversity combiner counts a flying decoder as present (it waits for its fields).
+- `test_pipeline fly`: scraps 50/20/10 % (fields keep coming, rows in place ~ the signal share, no false re-syncs), 2 s outage,
+  VTX restart with a new line phase and with a new field phase, NTSC lost and back as PAL (synth `synth_std_at`: the
+  flywheel sees the new line period and relocks). `test_pipeline bench [case] [nofly]` has scraps cases.
+- Not tested: live on the Pi.
+
+### Flywheel: status (2026-11-28)
+
+Done on the PC and tested, not committed yet. Still to do:
+1. Commit (when the user asks).
+2. On the Pi (only when the user says the VRX is free): deploy, record a weak-signal capture
+   (`sudo systemctl stop c5div; sudo c5div record --seconds 20 -O weak.raw`), replay with and without `--no-flywheel`, watch
+   live on AV next to the goggles, check CPU with `-v`.
+
 ## Findings
 
 - **The streaks were ours.** The quasi-periodic coloured streaks in the live picture came from sampling on changing bits each time
