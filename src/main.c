@@ -80,9 +80,10 @@ static size_t status_json(void *ctx, char *buf, size_t n)
     for (int r = 0; r < a->nrx; r++) {
         decoder_stats_t *s = decoder_stats(pipeline_rx(a->pl, r));
         o += (size_t)snprintf(buf + o, n - o,
-                              "%s{\"name\":\"%c\",\"locked\":%s,\"std\":\"%s\",\"snr_db\":%.1f,\"use\":%.3f,"
+                              "%s{\"name\":\"%c\",\"locked\":%s,\"fly\":%s,\"std\":\"%s\",\"snr_db\":%.1f,\"use\":%.3f,"
                               "\"sync_amp\":%.1f,\"burst\":%.2f,\"fields\":%llu,\"lock_losses\":%llu}",
                               r ? "," : "", 'A' + r, atomic_load(&s->locked) ? "true" : "false",
+                              atomic_load(&s->fly) ? "true" : "false",
                               std_name((video_std_t)atomic_load(&s->std)), atomic_load(&s->snr_db),
                               pipeline_share(a->pl, r), atomic_load(&s->sync_amp), atomic_load(&s->burst),
                               (unsigned long long)atomic_load(&s->fields),
@@ -94,8 +95,9 @@ static size_t status_json(void *ctx, char *buf, size_t n)
         fusion_stats_t *fs = fusion_stats(fu);
         decoder_stats_t *s = decoder_stats(pipeline_fused(a->pl));
         o += (size_t)snprintf(buf + o, n - o,
-                              ",\"fused\":{\"locked\":%s,\"snr_db\":%.1f,\"aligned\":%s,\"delay_us\":%.3f}",
-                              atomic_load(&s->locked) ? "true" : "false", atomic_load(&s->snr_db),
+                              ",\"fused\":{\"locked\":%s,\"fly\":%s,\"snr_db\":%.1f,\"aligned\":%s,\"delay_us\":%.3f}",
+                              atomic_load(&s->locked) ? "true" : "false", atomic_load(&s->fly) ? "true" : "false",
+                              atomic_load(&s->snr_db),
                               atomic_load(&fs->aligned) ? "true" : "false", atomic_load(&fs->delay_us));
         if (o >= n) return 0;
     }
@@ -180,11 +182,15 @@ static void print_status(app_t *a)
             o += snprintf(line + o, sizeof(line) - (size_t)o, "%c: %s %4.1fdB use %3.0f%% | ", 'A' + r,
                           std_name((video_std_t)atomic_load(&s->std)), atomic_load(&s->snr_db),
                           100.0f * pipeline_share(a->pl, r));
+        else if (atomic_load(&s->fly))
+            o += snprintf(line + o, sizeof(line) - (size_t)o, "%c: flywheel         | ", 'A' + r);
         else
             o += snprintf(line + o, sizeof(line) - (size_t)o, "%c: no lock          | ", 'A' + r);
     }
     if (fused && atomic_load(&decoder_stats(fused)->locked))
         o += snprintf(line + o, sizeof(line) - (size_t)o, "fused %4.1fdB | ", atomic_load(&decoder_stats(fused)->snr_db));
+    else if (fused && atomic_load(&decoder_stats(fused)->fly))
+        o += snprintf(line + o, sizeof(line) - (size_t)o, "fused flywheel | ");
     uint64_t skip = fused ? atomic_load(&decoder_stats(fused)->fields_skipped) : 0;
     for (int r = 0; !fused && r < a->nrx; r++)
         skip += atomic_load(&decoder_stats(pipeline_rx(a->pl, r))->fields_skipped);
@@ -245,6 +251,8 @@ static void usage(void)
 "      --synth-fade SEC    A and B fade alternately with this period\n"
 "      --synth-gaps SEC    emulate SMI read gaps every SEC seconds\n"
 "      --no-reclock        skip C5 code-clock recovery (it needs 25 MS/s captures)\n"
+"      --no-flywheel       stop decoding when the sync is lost (default: keep the line and field\n"
+"                          timing going and show what arrives, picture scraps or noise)\n"
 "      --synth-ppm A,B     C5 clock errors\n"
 "      --synth-fakevs N    inject N line-aligned fake vertical syncs per second\n"
 "      --synth-delay US    receiver B sees the video US microseconds later\n"
@@ -299,7 +307,7 @@ int main(int argc, char **argv)
     enum {
         O_RX = 256, O_FS, O_SMI_TIMING, O_SMI_SWAP, O_BLOCK, O_SECONDS, O_FAST, O_HDMI_MODE, O_STRETCH,
         O_WEB_PORT, O_WEB_FPS, O_JPEG_Q, O_DEINT, O_NO_OSD, O_STD, O_DIV, O_HYST, O_BLEND_DB, O_MONO, O_SAT,
-        O_DMA_CHAN, O_DMA_FORCE, O_WORKERS, O_CONTRAST, O_BRIGHT, O_HSHIFT, O_VOFF, O_NO_MEDIAN, O_HQ, O_NO_CAVG, O_SN, O_SC, O_SF, O_SG, O_SFV, O_SDL, O_RECLK, O_SPPM, O_AVSTD, O_AVPROG, O_JSIM, O_CHAN,
+        O_DMA_CHAN, O_DMA_FORCE, O_WORKERS, O_CONTRAST, O_BRIGHT, O_HSHIFT, O_VOFF, O_NO_MEDIAN, O_HQ, O_NO_CAVG, O_SN, O_SC, O_SF, O_SG, O_SFV, O_SDL, O_RECLK, O_NOFLY, O_SPPM, O_AVSTD, O_AVPROG, O_JSIM, O_CHAN,
     };
     static const struct option opts[] = {
         {"source", required_argument, 0, 's'}, {"output", required_argument, 0, 'o'},
@@ -319,7 +327,8 @@ int main(int argc, char **argv)
         {"median", no_argument, 0, O_NO_MEDIAN}, {"hq", no_argument, 0, O_HQ}, {"no-chroma-avg", no_argument, 0, O_NO_CAVG},
         {"synth-noise", required_argument, 0, O_SN}, {"synth-clicks", required_argument, 0, O_SC},
         {"synth-fade", required_argument, 0, O_SF}, {"synth-gaps", required_argument, 0, O_SG}, {"synth-fakevs", required_argument, 0, O_SFV}, {"synth-delay", required_argument, 0, O_SDL}, {"av-std", required_argument, 0, O_AVSTD}, {"channel-uart", required_argument, 0, O_CHAN}, {"av-progressive", no_argument, 0, O_AVPROG}, {"jumper-sim", required_argument, 0, O_JSIM},
-        {"no-reclock", no_argument, 0, O_RECLK}, {"synth-ppm", required_argument, 0, O_SPPM},
+        {"no-reclock", no_argument, 0, O_RECLK}, {"no-flywheel", no_argument, 0, O_NOFLY},
+        {"synth-ppm", required_argument, 0, O_SPPM},
         {0, 0, 0, 0},
     };
     int c;
@@ -387,6 +396,7 @@ int main(int argc, char **argv)
         case O_AVPROG: av_prog = true; break;
         case O_JSIM: jumper_sim = optarg; break;    /* testing: file instead of GPIOs */
         case O_RECLK: dcfg.reclock = false; break;
+        case O_NOFLY: dcfg.flywheel = false; break;
         case O_SPPM: {
             double pa = 0, pb = 0;
             sscanf(optarg, "%lf,%lf", &pa, &pb);
@@ -552,15 +562,20 @@ int main(int argc, char **argv)
          (unsigned long long)atomic_load(&ds->dropped));
     for (int r = 0; r < nrx; r++) {
         decoder_stats_t *st = decoder_stats(pipeline_rx(pl, r));
-        LOGD("rx%c: decoder fields %llu, vsyncs %llu (rejected %llu, flywheel %llu), lock losses %llu, lines %llu",
+        LOGD("rx%c: decoder fields %llu, vsyncs %llu (rejected %llu, flywheel %llu), lock losses %llu, lines %llu, "
+             "sync lost %llu times (%llu lines on the flywheel, %llu re-syncs)",
              'A' + r, (unsigned long long)atomic_load(&st->fields), (unsigned long long)atomic_load(&st->vsyncs),
              (unsigned long long)atomic_load(&st->vsync_rejected), (unsigned long long)atomic_load(&st->vsync_flywheel),
-             (unsigned long long)atomic_load(&st->lock_losses), (unsigned long long)atomic_load(&st->lines));
+             (unsigned long long)atomic_load(&st->lock_losses), (unsigned long long)atomic_load(&st->lines),
+             (unsigned long long)atomic_load(&st->fly_entries), (unsigned long long)atomic_load(&st->fly_lines),
+             (unsigned long long)atomic_load(&st->fly_resyncs));
     }
     if (pipeline_fusion(pl)) {
         fusion_stats_t *fs = fusion_stats(pipeline_fusion(pl));
         decoder_stats_t *st = decoder_stats(pipeline_fused(pl));
-        LOGD("fused: skipped fields %llu", (unsigned long long)atomic_load(&st->fields_skipped));
+        LOGD("fused: skipped fields %llu, sync lost %llu times (%llu lines on the flywheel, %llu re-syncs)",
+             (unsigned long long)atomic_load(&st->fields_skipped), (unsigned long long)atomic_load(&st->fly_entries),
+             (unsigned long long)atomic_load(&st->fly_lines), (unsigned long long)atomic_load(&st->fly_resyncs));
         LOGD("fused: fields %llu, vsyncs %llu (rejected %llu, flywheel %llu), lock losses %llu, snr %.1f dB, "
              "B delay %.3f us, outliers A %llu B %llu, realigns %llu",
              (unsigned long long)atomic_load(&st->fields), (unsigned long long)atomic_load(&st->vsyncs),
