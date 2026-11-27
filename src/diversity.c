@@ -207,6 +207,7 @@ static void fill_osd(diversity_t *dv, osd_info_t *o)
     o->nrx = dv->nrx;
     for (int r = 0; r < 2; r++) {
         o->locked[r] = dv->dec[r] ? atomic_load(&decoder_stats(dv->dec[r])->locked) : false;
+        o->fly[r] = dv->dec[r] ? atomic_load(&decoder_stats(dv->dec[r])->fly) : false;
         o->snr_db[r] = dv->dec[r] ? atomic_load(&decoder_stats(dv->dec[r])->snr_db) : 0;
         o->sel_frac[r] = atomic_load(&dv->st.sel_frac[r]);
     }
@@ -240,7 +241,9 @@ static int decide(diversity_t *dv, field_t **fa, field_t **fb)
             return ACT_PAIR;
         }
     }
-    bool other_gone = dv->eof[o] || !dv->dec[o] || !atomic_load(&decoder_stats(dv->dec[o])->locked);
+    /* A decoder on its flywheel still delivers fields: wait for them. */
+    bool other_gone = dv->eof[o] || !dv->dec[o] ||
+                      !(atomic_load(&decoder_stats(dv->dec[o])->locked) || atomic_load(&decoder_stats(dv->dec[o])->fly));
     uint64_t prog = dv->dec[o] ? atomic_load(&decoder_stats(dv->dec[o])->progress) : 0;
     double line = flen / std_params(F->std)->lines_per_field;
     bool other_past = (double)prog > (double)F->end_pos + 8.0 * line;

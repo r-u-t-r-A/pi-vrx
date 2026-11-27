@@ -144,7 +144,8 @@ static void build_weave(frame_t *fr, const field_t *cur, const field_t *prev)
     }
 }
 
-/* Two signal bars, top-left: length = SNR, bright/green = receiver in use. */
+/* Two signal bars, top-left: length = SNR, bright/green = receiver in use,
+ * orange = flywheel (no sync, timing held), red = no lock. */
 static void draw_osd(frame_t *fr, const osd_info_t *o)
 {
     if (!o)
@@ -152,7 +153,7 @@ static void draw_osd(frame_t *fr, const osd_info_t *o)
     const int bw = 160, bh = 10, x0 = 24, y0 = 24;
     for (int r = 0; r < o->nrx && r < 2; r++) {
         int yb = y0 + r * (bh + 6);
-        float frac = o->locked[r] ? clampf(o->snr_db[r] / 36.0f, 0.0f, 1.0f) : 0.0f;
+        float frac = o->locked[r] || o->fly[r] ? clampf(o->snr_db[r] / 36.0f, 0.0f, 1.0f) : 0.0f;
         int fill = (int)(frac * bw);
         bool active = o->sel_frac[r] >= 0.5f;
         for (int yy = yb; yy < yb + bh && yy < fr->h; yy++) {
@@ -165,7 +166,9 @@ static void draw_osd(frame_t *fr, const osd_info_t *o)
             uint8_t *v = fr->v + (size_t)yy * (fr->w / 2);
             for (int xx = x0 / 2; xx < (x0 + bw) / 2; xx++) {
                 bool in = xx * 2 - x0 < fill;
-                if (!o->locked[r]) {
+                if (o->fly[r] && !o->locked[r]) {
+                    u[xx] = 70; v[xx] = 190;             /* orange: flywheel */
+                } else if (!o->locked[r]) {
                     u[xx] = 110; v[xx] = 200;            /* red: no lock */
                 } else if (in && active) {
                     u[xx] = 70; v[xx] = 70;              /* green: in use */

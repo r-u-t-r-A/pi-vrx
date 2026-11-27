@@ -21,7 +21,16 @@
 #define SR_TAPS 8                   /* short resampler for clean 20 MS/s codes (no hold images) */
 #define ACQ_N 8
 
-enum { ST_ACQ = 0, ST_LOCK = 1 };
+/* ST_FLY (flywheel): the line and field timing are known but the sync is
+ * gone. Lines and fields go on at the last line period and the picture is
+ * decoded from whatever arrives (scraps of video, or noise), like the
+ * flywheel of an analog TV. Back to ST_LOCK on consistent sync evidence. */
+enum { ST_ACQ = 0, ST_LOCK = 1, ST_FLY = 2 };
+#define FLY_AFTER 4         /* lines without sync before the flywheel takes over */
+#define FV_N 64             /* hsync phase votes kept */
+#define FV_LINES 8          /* ... from this many lines */
+#define FV_NEED 7           /* lines of FV_LINES with the sync in one place */
+#define FV_TOL_US 0.4       /* ... within this */
 
 #define JOBQ 64
 #define MAX_WORKERS 4
@@ -105,6 +114,16 @@ struct decoder {
     double last_unmatched;
     double acq[ACQ_N];
     int acq_n;
+    /* flywheel */
+    struct { float err; uint32_t line; } fv[FV_N];
+    int fv_n;
+    uint32_t fly_line;      /* lines since entering ST_FLY */
+    int good_run;           /* consecutive matched lines in ST_LOCK */
+    bool have_trust;        /* timing of the last clean stretch (8 matched lines): */
+    double trust_h;         /* a line start */
+    double trust_H;         /* line period, long-term average over clean lines: the PLL's own
+                             * period moves with every correction (beta), the real one is crystal-stable */
+    uint8_t fly_hits;       /* last 8 lines: hsync within 1 us of the prediction */
     bool resync_pending;
     uint64_t resync_pos;
     uint64_t gap_lo, gap_hi;
@@ -191,6 +210,7 @@ void decoder_cfg_default(decoder_cfg_t *c)
     c->pll_alpha = 0.35f;
     c->pll_beta = 0.02f;
     c->workers = 2;
+    c->flywheel = true;
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -297,7 +317,7 @@ static uint64_t keep_from(const decoder_t *d)
 {
     uint64_t k = d->scan > (uint64_t)(d->nb + 8) ? d->scan - (uint64_t)(d->nb + 8) : 0;
     double back = 2.5 * d->H;
-    double c = d->state == ST_LOCK ? d->cur_h - back : (double)d->scan - back;
+    double c = d->state != ST_ACQ ? d->cur_h - back : (double)d->scan - back;
     if (c < (double)k)
         k = c > 0 ? (uint64_t)c : 0;
     if (k < d->base)
@@ -526,7 +546,10 @@ static void lose_lock(decoder_t *d)
     d->broad_run = 0;
     d->R_ok = false;
     d->pb_ok = false;
+    d->have_trust = false;
+    d->good_run = 0;
     atomic_store(&d->st.locked, false);
+    atomic_store(&d->st.fly, false);
     atomic_fetch_add(&d->st.lock_losses, 1);
     LOGD("rx%c: lock lost", 'A' + d->id);
 }
@@ -1290,6 +1313,36 @@ static void process_line(decoder_t *d)
 
 /* ------------------------------------------------------------ PLL engine */
 
+/* One hsync-width pulse into the acquisition window: true, with the line
+ * period, when the last ACQ_N pulses are evenly spaced like line syncs. */
+static bool acq_push(decoder_t *d, double fall, double *period)
+{
+    const double spu0 = d->fs_cal / 1e6;
+    if (d->acq_n == ACQ_N) {
+        memmove(d->acq, d->acq + 1, sizeof(double) * (ACQ_N - 1));
+        d->acq_n--;
+    }
+    d->acq[d->acq_n++] = fall;
+    if (d->acq_n < ACQ_N)
+        return false;
+    double iv[ACQ_N - 1], srt[ACQ_N - 1];
+    for (int i = 0; i < ACQ_N - 1; i++)
+        srt[i] = iv[i] = d->acq[i + 1] - d->acq[i];
+    for (int i = 1; i < ACQ_N - 1; i++)   /* insertion sort */
+        for (int j = i; j > 0 && srt[j - 1] > srt[j]; j--) {
+            double t = srt[j];
+            srt[j] = srt[j - 1];
+            srt[j - 1] = t;
+        }
+    double m = srt[(ACQ_N - 1) / 2];
+    bool ok = m > 55.0 * spu0 && m < 72.0 * spu0;
+    for (int i = 0; i < ACQ_N - 1 && ok; i++)
+        if (fabs(iv[i] - m) > 0.01 * m)
+            ok = false;
+    *period = m;
+    return ok;
+}
+
 static bool acquire(decoder_t *d)
 {
     const double spu0 = d->fs_cal / 1e6;
@@ -1299,28 +1352,8 @@ static bool acquire(decoder_t *d)
         double w = (p.rise - p.fall) / spu0;
         if (w < 3.5 || w > 7.5)
             continue;
-        if (d->acq_n == ACQ_N) {
-            memmove(d->acq, d->acq + 1, sizeof(double) * (ACQ_N - 1));
-            d->acq_n--;
-        }
-        d->acq[d->acq_n++] = p.fall;
-        if (d->acq_n < ACQ_N)
-            continue;
-        double iv[ACQ_N - 1], srt[ACQ_N - 1];
-        for (int i = 0; i < ACQ_N - 1; i++)
-            srt[i] = iv[i] = d->acq[i + 1] - d->acq[i];
-        for (int i = 1; i < ACQ_N - 1; i++)   /* insertion sort */
-            for (int j = i; j > 0 && srt[j - 1] > srt[j]; j--) {
-                double t = srt[j];
-                srt[j] = srt[j - 1];
-                srt[j - 1] = t;
-            }
-        double m = srt[(ACQ_N - 1) / 2];
-        bool ok = m > 55.0 * spu0 && m < 72.0 * spu0;
-        for (int i = 0; i < ACQ_N - 1 && ok; i++)
-            if (fabs(iv[i] - m) > 0.01 * m)
-                ok = false;
-        if (!ok)
+        double m;
+        if (!acq_push(d, p.fall, &m))
             continue;
         d->H = m;
         d->cur_h = d->acq[ACQ_N - 1];
@@ -1369,12 +1402,175 @@ static void classify(decoder_t *d, const pulse_t *p, bool matched)
     }
 }
 
+/* ------------------------------------------------------------ flywheel */
+
+static bool can_fly(const decoder_t *d)
+{
+    return d->cfg.flywheel && d->std_ok && d->lvl_ok && d->have_vs && d->vlock;
+}
+
+static void fly_clear(decoder_t *d)
+{
+    d->fv_n = 0;
+    d->fly_hits = 0;
+}
+
+static void enter_fly(decoder_t *d)
+{
+    /* The last few lines before this followed noise pulses (phase and
+     * period): carry on from the last clean stretch instead. */
+    if (d->have_trust) {
+        /* The phase only from a recent stretch: over many lines even a
+         * ppm-level period error adds up. */
+        const double n = floor((d->cur_h - d->trust_h) / d->trust_H + 0.5);
+        if (n <= 64)
+            d->cur_h = d->trust_h + n * d->trust_H;
+        d->H = d->trust_H;
+    }
+    d->state = ST_FLY;
+    d->fly_line = 0;
+    d->acq_n = 0;
+    d->have_unmatched = false;
+    fly_clear(d);
+    atomic_store(&d->st.locked, false);
+    atomic_store(&d->st.fly, true);
+    atomic_fetch_add(&d->st.fly_entries, 1);
+    LOGD("rx%c: sync lost, flywheel", 'A' + d->id);
+}
+
+static inline double wrap_line(const decoder_t *d, double e) { return e - d->H * floor(e / d->H + 0.5); }
+
+/* Votes: the phase errors of the hsync-width pulses of the last FV_LINES
+ * lines, relative to each line's predicted start. A real sync puts one at
+ * the same place on (nearly) every line, noise pulses fall anywhere.
+ *
+ * fly_vote(): the lines among the earlier ones with a vote within FV_TOL of
+ * err, and the mean position of those votes and err. */
+static int fly_vote(const decoder_t *d, double err, double *mean)
+{
+    const double tol = FV_TOL_US * spu_of(d);
+    double s = 0;
+    int lines = 0;
+    uint32_t last = UINT32_MAX;
+    for (int i = 0; i < d->fv_n; i++) {
+        if (d->fv[i].line == d->fly_line || d->fv[i].line == last)
+            continue;
+        const double e = wrap_line(d, d->fv[i].err - err);
+        if (fabs(e) <= tol) {
+            s += e;
+            lines++;
+            last = d->fv[i].line;
+        }
+    }
+    *mean = wrap_line(d, err + s / (lines + 1));
+    return lines;
+}
+
+static void fly_vote_add(decoder_t *d, double err)
+{
+    if (d->fv_n == FV_N) {   /* full: drop the oldest */
+        memmove(d->fv, d->fv + 1, sizeof(d->fv[0]) * (FV_N - 1));
+        d->fv_n--;
+    }
+    d->fv[d->fv_n].err = (float)err;
+    d->fv[d->fv_n].line = d->fly_line;
+    d->fv_n++;
+}
+
+static void fly_vote_expire(decoder_t *d)
+{
+    int k = 0;
+    while (k < d->fv_n && d->fly_line - d->fv[k].line >= FV_LINES)
+        k++;
+    if (k) {
+        memmove(d->fv, d->fv + k, sizeof(d->fv[0]) * (size_t)(d->fv_n - k));
+        d->fv_n -= k;
+    }
+}
+
+/* One line in ST_FLY. Returns false when it needs more input. */
+static bool fly_line(decoder_t *d)
+{
+    const double spu = spu_of(d);
+    const double pred = d->cur_h + d->H;
+    if ((double)(d->base + d->len) < pred + 2.0 * spu || horizon(d) <= pred + 0.5 * d->H)
+        return false;
+    d->resync_pending = false;
+    fly_vote_expire(d);
+    pulse_t best = {0, 0};
+    double best_err = 1e30, shift = 0;
+    bool moved = false;
+    while (d->pq_n && pq_front(d)->fall < pred + 0.5 * d->H) {
+        pulse_t p = pq_pop(d);
+        classify(d, &p, true);
+        const double w = (p.rise - p.fall) / spu;
+        if (w < 3.5 || w > 7.5)
+            continue;
+        double period;
+        if (acq_push(d, p.fall, &period) && fabs(period / d->H - 1.0) > 0.003) {
+            /* Steady line syncs at another rate: another camera or standard. */
+            LOGD("rx%c: new line period %.3f us", 'A' + d->id, period / spu);
+            lose_lock(d);
+            return true;
+        }
+        const double err = p.fall - pred;
+        double m;
+        if (!moved && fly_vote(d, err, &m) >= FV_NEED - 1 && fabs(m) > 1.0 * spu) {
+            shift = m;   /* the sync is steady somewhere else in the line */
+            moved = true;
+        }
+        fly_vote_add(d, err);
+        if (fabs(err) < fabs(best_err)) {
+            best_err = err;
+            best = p;
+        }
+    }
+    const bool hit = fabs(best_err) <= 1.0 * spu;
+    d->fly_hits = (uint8_t)((d->fly_hits << 1) | hit);
+    double new_h = pred;
+    if (moved || __builtin_popcount(d->fly_hits) >= FV_NEED) {
+        /* Back on the real sync (where it was, or moved: a restarted camera
+         * or VTX); the PLL takes over again. */
+        if (moved) {
+            new_h = pred + shift;
+            atomic_fetch_add(&d->st.fly_resyncs, 1);
+            LOGD("rx%c: sync back %+.2f us away after %u lines", 'A' + d->id, shift / spu, d->fly_line);
+        } else {
+            new_h = pred + d->cfg.pll_alpha * best_err;
+            LOGD("rx%c: sync back after %u lines", 'A' + d->id, d->fly_line);
+        }
+        d->state = ST_LOCK;
+        d->coast = 0;
+        atomic_store(&d->st.fly, false);
+        atomic_store(&d->st.locked, true);
+    }
+    process_line(d);
+    d->cur_h = new_h;
+    d->cur_matched = d->state == ST_LOCK && hit && !moved;
+    d->cur_width = d->cur_matched ? best.rise - best.fall : 0;
+    d->fly_line++;
+    atomic_fetch_add(&d->st.fly_lines, 1);
+    return true;
+}
+
 static void engine(decoder_t *d)
 {
     for (;;) {
         if (d->state == ST_ACQ) {
             if (!acquire(d))
                 return;
+            continue;
+        }
+        if (d->state == ST_FLY) {
+            if (!fly_line(d))
+                return;
+            if (d->state == ST_ACQ)
+                continue;
+            if (d->have_vs && d->vlock) {
+                double lpf = d->lpf_meas > 0 ? d->lpf_meas : d->sp->lines_per_field;
+                if (d->cur_h > d->last_vs + (lpf + 4.5) * d->H)
+                    on_vsync(d, d->last_vs + lpf * d->H, true);
+            }
             continue;
         }
         const double spu = spu_of(d);
@@ -1436,13 +1632,21 @@ static void engine(decoder_t *d)
         d->cur_h = new_h;
         d->cur_matched = matched;
         d->cur_width = matched ? mp.rise - mp.fall : 0;
+        d->good_run = matched ? d->good_run + 1 : 0;
+        if (d->good_run >= 8) {
+            d->trust_H = d->have_trust ? d->trust_H + (d->H - d->trust_H) * (1.0 / 256) : d->H;
+            d->have_trust = true;
+            d->trust_h = new_h;
+        }
 
         if (d->have_vs && d->vlock) {   /* flywheel only with confirmed vertical timing */
             double lpf = d->lpf_meas > 0 ? d->lpf_meas : d->sp->lines_per_field;
             if (d->cur_h > d->last_vs + (lpf + 4.5) * d->H)   /* just past the vsync window */
                 on_vsync(d, d->last_vs + lpf * d->H, true);
         }
-        if (d->coast > 50) {
+        if (d->coast > FLY_AFTER && can_fly(d)) {
+            enter_fly(d);
+        } else if (d->coast > 50) {
             lose_lock(d);
             return;
         }
@@ -1605,7 +1809,7 @@ decoder_stats_t *decoder_stats(decoder_t *d) { return &d->st; }
 
 static void reset_stream(decoder_t *d, uint64_t start)
 {
-    if (d->state == ST_LOCK)
+    if (d->state != ST_ACQ)
         lose_lock(d);
     d->base = start;
     d->len = 0;
@@ -1720,6 +1924,7 @@ void decoder_feed_u8(decoder_t *d, const uint8_t *s, uint32_t n, uint64_t start,
 void decoder_get_timing(const decoder_t *d, decoder_timing_t *t)
 {
     t->locked = d->state == ST_LOCK;
+    t->fly = d->state == ST_FLY;
     t->vlock = d->vlock;
     t->H = d->H;
     t->line_pos = d->cur_h;

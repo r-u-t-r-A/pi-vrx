@@ -21,6 +21,7 @@ typedef struct {
 typedef struct {
     int nrx;
     bool locked[2];
+    bool fly[2];           /* flywheel: no sync, timing held */
     float snr_db[2];
     float sel_frac[2];     /* share of lines taken from each receiver (last field) */
 } osd_info_t;

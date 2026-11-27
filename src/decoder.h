@@ -42,12 +42,14 @@ typedef struct {
     int workers;           /* threads decoding active lines (0 = inline) */
     bool reclock;          /* recover the C5's code clock first (25 MS/s captures) */
     int code_max;          /* input code range: 63 raw C5 codes (default), 255 fused stream */
+    bool flywheel;         /* keep producing lines and fields through sync loss (sync reconstruction) */
 } decoder_cfg_t;
 
 void decoder_cfg_default(decoder_cfg_t *c);
 
 typedef struct {
     atomic_bool locked;
+    atomic_bool fly;                /* flywheel: timing held without sync, picture still decoded */
     atomic_int std;
     atomic_uint_fast64_t progress;  /* virtual sample index fully processed */
     _Atomic float snr_db;           /* smoothed line quality */
@@ -58,6 +60,7 @@ typedef struct {
     _Atomic float burst;            /* burst amplitude relative to nominal */
     atomic_uint_fast64_t fields, lines, coasted, resyncs, lock_losses, vsync_flywheel, fields_skipped, gaps;
     atomic_uint_fast64_t pulses_hsync, pulses_eq, pulses_broad, pulses_other, vsyncs, vsync_rejected;
+    atomic_uint_fast64_t fly_entries, fly_lines, fly_resyncs;
 } decoder_stats_t;
 
 typedef struct decoder decoder_t;
@@ -65,7 +68,7 @@ typedef struct decoder decoder_t;
 /* Line/field timing and levels, for another thread (fusion). Positions
  * are absolute sample indices of the capture stream. */
 typedef struct {
-    bool locked, vlock;
+    bool locked, vlock, fly;
     double H;               /* samples per line */
     double line_pos;        /* start of a recent line */
     double last_vs;         /* start of the last vertical sync */
