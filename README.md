@@ -164,34 +164,32 @@ an NTSC camera:
   channel is stopped. (The kernel `/dev/smi` path, `-s smidev`, loses 20–30 % of the
   signal and is only a fallback.)
 - **Picture:** live colour video. C5 code clock recovery removed the coloured streaks
-  and the diagonal pattern in replays of a real recording.
+  and the diagonal pattern in replays of a real recording, VRX supports both NTSC and PAL
+  video standards.
 - **Diversity:** live fusion of both receivers.
 - **Web viewer** over the Pi's Wi-Fi access point.
-- **Composite AV output:** tested on a real display. Latency from camera to screen is
+- **Composite AV output:** tested with an AV capture card. Latency from camera to screen is
   300–400 ms.
-- **Operation:** starts at boot as a service, about 22 s after power-on; the Wi-Fi
+- **Operation:** starts at boot as a service, about 22 s after power-on; the Wi-Fi stream enable
   jumper works.
 - **Speed:** two-receiver recordings play at 59.9 fields/s in real time with the web
   viewer connected and no skipped fields. When the CPU is short, whole fields are
-  skipped and the log says so. The Pi gets warm (72 °C seen): use a heatsink.
+  skipped and the log says so. The Pi gets warm, adding a heatsink is recommended.
+- **Flywheel / Sync reconstruction** - fixes issues with frezees in the video and stuck frames,
+  keeps a smooth running feed even when barely any signal is received. Tested using tinywhoops flown
+  in RF congested environments.
 
 Not tested yet, or only in simulation:
 
-- **HDMI:** no display test on record; the code is tested against a fake libdrm
+- **HDMI:** no display on a real monitor yet; the code is tested against a fake libdrm
   (`test_outputs`).
 - **Switching between HDMI and AV while running** (AV jumper) without a reboot.
-- **PAL:** synthetic source only.
-- **Flywheel / weak signal:** tested on the synthetic source (signal in 1–4 ms scraps,
-  outages, a restarted VTX, another camera standard after an outage) and on recordings;
-  not yet live on the Pi.
-- **Range and flight:** no test on record.
 
 ## Roadmap
 
-1. HDMI on a real display; PAL camera.
-2. Comparison of the firmware's demodulators (D32, P64, U50P64, U85Q).
-3. A 2-D comb filter to reduce the remaining cross-colour/cross-luminance.
-4. Hardware H.264 (bcm2835 V4L2 M2M) for lower Wi-Fi bandwidth, plus an RTP/UDP output.
+1. HDMI on a real display.
+2. A 2-D comb filter to reduce the remaining cross-colour/cross-luminance.
+3. Hardware H.264 (bcm2835 V4L2 M2M) for lower Wi-Fi bandwidth, plus an RTP/UDP output.
 
 The firmware is a git submodule ([fork of C5VRX](https://github.com/r-u-t-r-A/C5VRX),
 branch `c5div-lite`): `git submodule update --init` fetches it. The Pi does not need it.
